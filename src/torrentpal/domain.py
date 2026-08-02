@@ -10,6 +10,12 @@ class TorrentFile:
 
 
 @dataclass(frozen=True, slots=True)
+class Tag:
+    name: str
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
 class TorrentMetadata:
     name: str
     info_hash_v1: str

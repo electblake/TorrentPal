@@ -24,13 +24,14 @@ from PySide6.QtWidgets import (
 
 from torrentpal.config import DATA_DIR, SETTINGS
 from torrentpal.domain import TorrentMetadata
-from torrentpal.media import cached_images, download_images, first_url
+from torrentpal.media import cached_images, download_images, download_tags, first_url
 from torrentpal.models import FileTreeModel, MetadataTableModel, TrackerModel
 from torrentpal.parser import parse_torrent
 from torrentpal.widgets import (
     CollapsiblePanel,
     DropZone,
     ImageGallery,
+    TagGrid,
     comment_browser,
     file_tree,
     metadata_table,
@@ -147,6 +148,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(images_browser_group)
         layout.addSpacing(16)
 
+        tags_group = QGroupBox("Tags")
+        tags_group.setObjectName("tagsSettingsGroup")
+        tags_form = QFormLayout(tags_group)
+        self.tag_selectors = QTextEdit()
+        self.tag_selectors.setObjectName("tagSelectors")
+        self.tag_selectors.setPlaceholderText("One CSS selector per line")
+        tags_form.addRow("Selectors", self.tag_selectors)
+        self.tag_minimum_link_text_length = QSpinBox()
+        self.tag_minimum_link_text_length.setObjectName("tagMinimumLinkTextLength")
+        self.tag_minimum_link_text_length.setRange(1, 100)
+        tags_form.addRow("Min Tag Link Text Length", self.tag_minimum_link_text_length)
+        self.tag_name_excludes = QTextEdit()
+        self.tag_name_excludes.setObjectName("tagNameExcludes")
+        self.tag_name_excludes.setPlaceholderText("One regular expression per line")
+        tags_form.addRow("Tag Name Excludes", self.tag_name_excludes)
+        layout.addWidget(tags_group)
+        layout.addSpacing(16)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Reset
@@ -182,6 +201,15 @@ class MainWindow(QMainWindow):
         self.torrent_images_maximum.setValue(
             SETTINGS.value("torrent_images_maximum", 10, type=int)
         )
+        self.tag_selectors.setPlainText(
+            SETTINGS.value("tag_selectors", "#torrent_tags_list", type=str)
+        )
+        self.tag_minimum_link_text_length.setValue(
+            SETTINGS.value("tag_minimum_link_text_length", 3, type=int)
+        )
+        self.tag_name_excludes.setPlainText(
+            SETTINGS.value("tag_name_excludes", "\\[-\\]\n\\[N\\]", type=str)
+        )
         cookies_path = Path(cookies_file)
         if cookies_path.exists():
             self.cookies_text.setPlainText(cookies_path.read_text(encoding="utf-8"))
@@ -200,6 +228,12 @@ class MainWindow(QMainWindow):
         SETTINGS.setValue("image_minimum_width", self.image_minimum_width.value())
         SETTINGS.setValue("image_minimum_height", self.image_minimum_height.value())
         SETTINGS.setValue("torrent_images_maximum", self.torrent_images_maximum.value())
+        SETTINGS.setValue("tag_selectors", self.tag_selectors.toPlainText())
+        SETTINGS.setValue(
+            "tag_minimum_link_text_length",
+            self.tag_minimum_link_text_length.value(),
+        )
+        SETTINGS.setValue("tag_name_excludes", self.tag_name_excludes.toPlainText())
         SETTINGS.sync()
         self.stack.setCurrentWidget(self.input_page)
 
@@ -208,12 +242,18 @@ class MainWindow(QMainWindow):
         SETTINGS.remove("image_minimum_width")
         SETTINGS.remove("image_minimum_height")
         SETTINGS.remove("torrent_images_maximum")
+        SETTINGS.remove("tag_selectors")
+        SETTINGS.remove("tag_minimum_link_text_length")
+        SETTINGS.remove("tag_name_excludes")
         SETTINGS.sync()
         self.cookies_path.clear()
         self.cookies_text.clear()
         self.image_minimum_width.setValue(10)
         self.image_minimum_height.setValue(10)
         self.torrent_images_maximum.setValue(10)
+        self.tag_selectors.setPlainText("#torrent_tags_list")
+        self.tag_minimum_link_text_length.setValue(3)
+        self.tag_name_excludes.setPlainText("\\[-\\]\n\\[N\\]")
 
     def _browse(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -259,6 +299,12 @@ class MainWindow(QMainWindow):
             lambda: self._load_images(metadata, image_gallery)
         )
         layout.addWidget(image_gallery)
+        tags_group = QGroupBox("Tags")
+        tags_layout = QVBoxLayout(tags_group)
+        tag_grid = TagGrid()
+        tag_grid.load_requested.connect(lambda: self._load_tags(metadata, tag_grid))
+        tags_layout.addWidget(tag_grid)
+        layout.addWidget(tags_group)
         details_group = QGroupBox("Metadata")
         details_layout = QVBoxLayout(details_group)
         table = metadata_table()
@@ -343,3 +389,28 @@ class MainWindow(QMainWindow):
     def _show_fetch_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
         QApplication.processEvents()
+
+    def _load_tags(self, metadata: TorrentMetadata, tag_grid: TagGrid) -> None:
+        tag_grid.set_fetching(True)
+        self._show_fetch_status("Preparing tag fetch")
+        tags = download_tags(
+            first_url(metadata.comment),
+            Path(
+                SETTINGS.value("cookies_file", str(DATA_DIR / "cookies.txt"), type=str)
+            ),
+            tuple(
+                SETTINGS.value(
+                    "tag_selectors", "#torrent_tags_list", type=str
+                ).splitlines()
+            ),
+            SETTINGS.value("tag_minimum_link_text_length", 3, type=int),
+            tuple(
+                SETTINGS.value(
+                    "tag_name_excludes", "\\[-\\]\n\\[N\\]", type=str
+                ).splitlines()
+            ),
+            self._show_fetch_status,
+        )
+        tag_grid.set_tags(tags)
+        self._show_fetch_status(f"Fetched {len(tags)} tags")
+        tag_grid.set_fetching(False)

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+from torrentpal.domain import Tag
+
 
 def first_url(comment: str) -> str:
     return re.search(r"https?://[^\s<>\"']+", comment).group()
@@ -125,3 +127,63 @@ def download_images(
         minimum_height,
         maximum_images,
     )
+
+
+def download_tags(
+    page_url: str,
+    cookies_path: Path,
+    selectors: tuple[str, ...],
+    minimum_link_text_length: int,
+    name_excludes: tuple[str, ...],
+    report_status: Callable[[str], None],
+) -> tuple[Tag, ...]:
+    report_status("Loading browser cookies")
+    cookies_export = json.loads(cookies_path.read_text(encoding="utf-8"))
+    cookies = []
+    for exported_cookie in cookies_export:
+        cookie = {
+            "name": exported_cookie["name"],
+            "value": exported_cookie["value"],
+            "domain": exported_cookie["domain"],
+            "path": exported_cookie["path"],
+            "httpOnly": exported_cookie["httpOnly"],
+            "secure": exported_cookie["secure"],
+        }
+        if "expirationDate" in exported_cookie:
+            cookie["expires"] = exported_cookie["expirationDate"]
+        if exported_cookie["sameSite"] != "unspecified":
+            cookie["sameSite"] = {
+                "strict": "Strict",
+                "lax": "Lax",
+                "no_restriction": "None",
+            }[exported_cookie["sameSite"]]
+        cookies.append(cookie)
+
+    with sync_playwright() as playwright:
+        report_status("Starting headless browser")
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        context.add_cookies(cookies)
+        page = context.new_page()
+        report_status(f"Opening comment link: {page_url}")
+        page.goto(page_url)
+        report_status("Selecting qualifying tags")
+        links = page.locator(", ".join(f"{selector} a" for selector in selectors))
+        candidates = links.evaluate_all(
+            """links => links.map(link => ({
+                name: link.textContent.trim(),
+                url: link.href
+            }))"""
+        )
+        tags = tuple(
+            Tag(candidate["name"], candidate["url"])
+            for candidate in candidates
+            if len(re.sub("[^a-z]", "", candidate["name"], flags=re.IGNORECASE))
+            >= minimum_link_text_length
+            and not any(
+                re.search(pattern, candidate["name"]) for pattern in name_excludes
+            )
+        )
+        browser.close()
+        report_status("Headless browser closed")
+    return tags

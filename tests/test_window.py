@@ -6,7 +6,8 @@ from PySide6.QtGui import QMovie, QPixmap
 from PySide6.QtWidgets import QGroupBox, QLabel, QPushButton, QTextBrowser
 
 import torrentpal.window
-from torrentpal.widgets import ImageGallery
+from torrentpal.domain import Tag
+from torrentpal.widgets import ImageGallery, TagGrid
 from torrentpal.window import MainWindow
 
 FIXTURE = Path(__file__).parent / "fixtures" / "known.torrent"
@@ -22,12 +23,16 @@ def test_window_opens_torrent(qtbot) -> None:
     assert 'href="https://example.com"' in comment.document().toHtml()
     assert comment.openExternalLinks()
     assert window.findChild(ImageGallery, "imageGallery") is not None
+    assert window.findChild(TagGrid, "tagGrid") is not None
+    assert window.findChild(QPushButton, "fetchTagsButton").text() == "Fetch Tags"
     assert window.findChild(QPushButton, "fetchImageButton").text() == "Fetch Image"
     assert window.statusBar().currentMessage() == "Ready"
 
 
 def test_window_loads_cached_image(qtbot, tmp_path, monkeypatch) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
     metadata = torrentpal.window.parse_torrent(FIXTURE)
     image_path = tmp_path / f"{metadata.info_hash_v1}_20x20_0"
     pixmap = QPixmap(20, 20)
@@ -44,7 +49,9 @@ def test_window_loads_cached_image(qtbot, tmp_path, monkeypatch) -> None:
 def test_window_cycles_cached_images_largest_first(
     qtbot, tmp_path, monkeypatch
 ) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
     metadata = torrentpal.window.parse_torrent(FIXTURE)
     large = tmp_path / f"{metadata.info_hash_v1}_20x20_0"
     small = tmp_path / f"{metadata.info_hash_v1}_10x10_1"
@@ -112,7 +119,9 @@ def test_image_fetch_reports_errors(qtbot, monkeypatch) -> None:
 
 
 def test_window_plays_cached_animated_image(qtbot, tmp_path, monkeypatch) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
     metadata = torrentpal.window.parse_torrent(FIXTURE)
     image_path = tmp_path / f"{metadata.info_hash_v1}_10x10_0"
     image_path.write_bytes(
@@ -152,17 +161,26 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 10
     assert window.image_minimum_height.value() == 10
     assert window.torrent_images_maximum.value() == 10
+    assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
+    assert window.tag_minimum_link_text_length.value() == 3
+    assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
     assert window.cookies_path.text() == str(torrentpal.window.DATA_DIR / "cookies.txt")
     window.cookies_path.setText("C:/cookies.txt")
     window.image_minimum_width.setValue(320)
     window.image_minimum_height.setValue(180)
     window.torrent_images_maximum.setValue(6)
+    window.tag_selectors.setPlainText("#torrent_tags_list\n.tags")
+    window.tag_minimum_link_text_length.setValue(4)
+    window.tag_name_excludes.setPlainText("\\[-\\]\nignore")
     qtbot.mouseClick(window.save_settings_button, Qt.MouseButton.LeftButton)
 
     assert settings.value("cookies_file", type=str) == "C:/cookies.txt"
     assert settings.value("image_minimum_width", type=int) == 320
     assert settings.value("image_minimum_height", type=int) == 180
     assert settings.value("torrent_images_maximum", type=int) == 6
+    assert settings.value("tag_selectors", type=str) == "#torrent_tags_list\n.tags"
+    assert settings.value("tag_minimum_link_text_length", type=int) == 4
+    assert settings.value("tag_name_excludes", type=str) == "\\[-\\]\nignore"
     assert window.stack.currentWidget() is window.input_page
 
     qtbot.mouseClick(settings_button, Qt.MouseButton.LeftButton)
@@ -170,14 +188,49 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 320
     assert window.image_minimum_height.value() == 180
     assert window.torrent_images_maximum.value() == 6
+    assert window.tag_selectors.toPlainText() == "#torrent_tags_list\n.tags"
+    assert window.tag_minimum_link_text_length.value() == 4
+    assert window.tag_name_excludes.toPlainText() == "\\[-\\]\nignore"
     qtbot.mouseClick(window.reset_settings_button, Qt.MouseButton.LeftButton)
     assert window.cookies_path.text() == ""
     assert window.image_minimum_width.value() == 10
     assert window.image_minimum_height.value() == 10
     assert window.torrent_images_maximum.value() == 10
+    assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
+    assert window.tag_minimum_link_text_length.value() == 3
+    assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
     assert not settings.contains("cookies_file")
     qtbot.mouseClick(window.cancel_settings_button, Qt.MouseButton.LeftButton)
     assert window.stack.currentWidget() is window.input_page
+
+
+def test_tag_fetch_populates_grid_and_status(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.open_torrent(FIXTURE)
+    grid = window.findChild(TagGrid, "tagGrid")
+
+    def fetch_tags(*arguments):
+        assert grid.load_button.text() == "Fetching.."
+        assert not grid.load_button.isEnabled()
+        return (
+            Tag("fake.tits", "https://example.com/torrents.php?taglist=fake.tits"),
+            Tag("amateur", "https://example.com/torrents.php?taglist=amateur"),
+        )
+
+    monkeypatch.setattr(torrentpal.window, "download_tags", fetch_tags)
+    qtbot.mouseClick(grid.load_button, Qt.MouseButton.LeftButton)
+
+    labels = window.findChildren(QLabel, "torrentTag")
+    assert [label.text() for label in labels] == [
+        '<a href="https://example.com/torrents.php?taglist=fake.tits">fake.tits</a>',
+        '<a href="https://example.com/torrents.php?taglist=amateur">amateur</a>',
+    ]
+    assert grid.tags_layout.itemAtPosition(0, 0).widget() is labels[0]
+    assert grid.tags_layout.itemAtPosition(0, 1).widget() is labels[1]
+    assert grid.load_button.text() == "Fetch Tags"
+    assert grid.load_button.isEnabled()
+    assert window.statusBar().currentMessage() == "Fetched 2 tags"
 
 
 def test_settings_back_returns_to_input(qtbot) -> None:

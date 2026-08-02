@@ -1,3 +1,4 @@
+import html
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -11,6 +12,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,6 +25,46 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from torrentpal.domain import Tag
+
+
+class TagGrid(QWidget):
+    load_requested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("tagGrid")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.tags_widget = QWidget()
+        self.tags_layout = QGridLayout(self.tags_widget)
+        self.tags_layout.setContentsMargins(0, 0, 0, 0)
+        self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self.tags_widget)
+        self.load_button = QPushButton("Fetch Tags")
+        self.load_button.setObjectName("fetchTagsButton")
+        self.load_button.clicked.connect(self.load_requested)
+        layout.addWidget(self.load_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def set_fetching(self, fetching: bool) -> None:
+        self.load_button.setText("Fetching.." if fetching else "Fetch Tags")
+        self.load_button.setEnabled(not fetching)
+
+    def set_tags(self, tags: tuple[Tag, ...]) -> None:
+        while self.tags_layout.count():
+            item = self.tags_layout.takeAt(0)
+            item.widget().deleteLater()
+        for index, tag in enumerate(tags):
+            link = QLabel(
+                f'<a href="{html.escape(tag.url, quote=True)}">'
+                f"{html.escape(tag.name)}</a>"
+            )
+            link.setObjectName("torrentTag")
+            link.setOpenExternalLinks(True)
+            link.setToolTip(tag.url)
+            self.tags_layout.addWidget(link, index // 4, index % 4)
 
 
 class ImageGallery(QWidget):
