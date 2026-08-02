@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
@@ -51,6 +53,23 @@ from torrentpal.widgets import (
     metadata_table,
     tracker_table,
 )
+
+
+class _ResultsSplitter(QSplitter):
+    def __init__(self) -> None:
+        super().__init__(Qt.Orientation.Horizontal)
+        self._initial_sizes_applied = False
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._initial_sizes_applied:
+            return
+        available_width = sum(self.sizes())
+        if available_width <= 0:
+            available_width = self.width() - self.handleWidth()
+        image_width = round(available_width * 0.6)
+        self.setSizes([image_width, available_width - image_width])
+        self._initial_sizes_applied = True
 
 
 class MainWindow(QMainWindow):
@@ -391,23 +410,24 @@ class MainWindow(QMainWindow):
 
     def _build_results_page(self, metadata: TorrentMetadata) -> QWidget:
         page, outer = self._page()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(16)
         back = QPushButton("Back")
+        back.setObjectName("resultsBackButton")
         back.clicked.connect(self._show_input_page)
-        layout.addWidget(back, alignment=Qt.AlignmentFlag.AlignLeft)
+        outer.addWidget(back, alignment=Qt.AlignmentFlag.AlignLeft)
+        outer.addSpacing(16)
         heading = QLabel(metadata.name)
+        heading.setObjectName("torrentTitle")
         heading_font = QFont(heading.font())
         heading_font.setPointSize(heading_font.pointSize() + 4)
         heading_font.setWeight(QFont.Weight.DemiBold)
         heading.setFont(heading_font)
         heading.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(heading)
+        outer.addWidget(heading)
+        outer.addSpacing(16)
+
+        splitter = _ResultsSplitter()
+        splitter.setObjectName("resultsSplitter")
+        splitter.setChildrenCollapsible(False)
         torrent_hash = metadata.info_hash_v1 or metadata.info_hash_v2
         image_paths = cached_images(
             DATA_DIR,
@@ -420,7 +440,22 @@ class MainWindow(QMainWindow):
         image_gallery.load_requested.connect(
             lambda: self._load_images(metadata, image_gallery)
         )
-        layout.addWidget(image_gallery)
+        image_gallery.setMinimumWidth(240)
+        image_gallery.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
+        )
+        splitter.addWidget(image_gallery)
+
+        details_scroll = QScrollArea()
+        details_scroll.setObjectName("resultsDetailsScroll")
+        details_scroll.setMinimumWidth(240)
+        details_scroll.setWidgetResizable(True)
+        details_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        details_content = QWidget()
+        details_content.setObjectName("resultsDetails")
+        layout = QVBoxLayout(details_content)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(16)
         tags_group = QGroupBox("Tags")
         tags_layout = QVBoxLayout(tags_group)
         tag_grid = TagGrid()
@@ -474,8 +509,11 @@ class MainWindow(QMainWindow):
             )
         )
         layout.addStretch()
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
+        details_scroll.setWidget(details_content)
+        splitter.addWidget(details_scroll)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        outer.addWidget(splitter, stretch=1)
         return page
 
     def _load_images(

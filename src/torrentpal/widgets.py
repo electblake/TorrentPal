@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QMouseEvent,
     QMovie,
     QPixmap,
+    QResizeEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -213,8 +214,9 @@ class ImageGallery(QWidget):
     def _cycle_view_mode(self) -> None:
         self._view_mode_index = (self._view_mode_index + 1) % len(self.VIEW_MODES)
         self._update_view_mode_label()
-        for index in range(self.pages.count()):
-            self._apply_view_mode(self.pages.widget(index))
+        current_image = self.pages.currentWidget()
+        if current_image is not None:
+            self._apply_view_mode(current_image)
 
     def _update_view_mode_label(self) -> None:
         self.view_mode_label.setText(f"View: {self.view_mode}")
@@ -234,17 +236,28 @@ class ImageGallery(QWidget):
         image.updateGeometry()
         self.pages.updateGeometry()
 
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if not self.isVisible():
+            return
+        current_image = self.pages.currentWidget()
+        if current_image is not None:
+            self._apply_view_mode(current_image)
+
     def _view_size(self, source_size: QSize) -> QSize:
         if not source_size.isValid():
             return QSize()
+        view_size = self.VIEW_SIZE
+        if self.isVisible() and self.pages.width() > 0 and self.pages.height() > 0:
+            view_size = self.pages.contentsRect().size()
         if self.view_mode == "Actual":
             return source_size
         if self.view_mode == "Fill Width":
             return QSize(
-                self.VIEW_SIZE.width(),
+                view_size.width(),
                 round(
                     source_size.height()
-                    * self.VIEW_SIZE.width()
+                    * view_size.width()
                     / source_size.width()
                 ),
             )
@@ -252,13 +265,13 @@ class ImageGallery(QWidget):
             return QSize(
                 round(
                     source_size.width()
-                    * self.VIEW_SIZE.height()
+                    * view_size.height()
                     / source_size.height()
                 ),
-                self.VIEW_SIZE.height(),
+                view_size.height(),
             )
         return source_size.scaled(
-            self.VIEW_SIZE,
+            view_size,
             Qt.AspectRatioMode.KeepAspectRatio,
         )
 
@@ -273,6 +286,7 @@ class ImageGallery(QWidget):
             current_image.movie().stop()
         self.pages.setCurrentIndex(index)
         current_image = self.pages.currentWidget()
+        self._apply_view_mode(current_image)
         if current_image.movie() is not None:
             current_image.movie().start()
         self.page_label.setText(f"{index + 1} / {self.pages.count()}")

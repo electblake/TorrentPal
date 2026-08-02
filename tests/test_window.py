@@ -1,9 +1,18 @@
 import json
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QMovie, QPixmap
-from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QPushButton, QTextBrowser
+from PySide6.QtWidgets import (
+    QApplication,
+    QGroupBox,
+    QLabel,
+    QPushButton,
+    QSplitter,
+    QTextBrowser,
+    QWidget,
+)
 
 import torrentpal.window
 from torrentpal.domain import Tag
@@ -27,6 +36,54 @@ def test_window_opens_torrent(qtbot) -> None:
     assert window.findChild(QPushButton, "fetchTagsButton").text() == "Fetch Tags"
     assert window.findChild(QPushButton, "fetchImageButton").text() == "Fetch Image"
     assert window.statusBar().currentMessage() == "Ready"
+
+
+def test_results_use_resizable_image_and_details_split(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    metadata = torrentpal.window.parse_torrent(FIXTURE)
+    image_path = tmp_path / f"{metadata.info_hash_v1}_1600x900_0"
+    pixmap = QPixmap(1600, 900)
+    pixmap.fill(Qt.GlobalColor.red)
+    pixmap.save(str(image_path), "PNG")
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.open_torrent(FIXTURE)
+    window.show()
+    qtbot.waitExposed(window)
+
+    splitter = window.findChild(QSplitter, "resultsSplitter")
+    gallery = window.findChild(ImageGallery, "imageGallery")
+    details = window.findChild(QWidget, "resultsDetails")
+    back = window.findChild(QPushButton, "resultsBackButton")
+    title = window.findChild(QLabel, "torrentTitle")
+
+    assert splitter.orientation() == Qt.Orientation.Horizontal
+    assert not splitter.childrenCollapsible()
+    assert splitter.widget(0) is gallery
+    assert splitter.widget(1).isAncestorOf(details)
+    assert not splitter.isAncestorOf(back)
+    assert not splitter.isAncestorOf(title)
+    assert details.isAncestorOf(window.findChild(TagGrid, "tagGrid"))
+    metadata_group = next(
+        group for group in details.findChildren(QGroupBox) if group.title() == "Metadata"
+    )
+    assert details.isAncestorOf(metadata_group)
+    left_width, right_width = splitter.sizes()
+    assert left_width / (left_width + right_width) == pytest.approx(0.6, abs=0.02)
+    available_width = left_width + right_width
+    splitter.setSizes([available_width // 2, available_width - available_width // 2])
+    QApplication.processEvents()
+    resized_left_width, resized_right_width = splitter.sizes()
+    assert resized_left_width / (
+        resized_left_width + resized_right_width
+    ) == pytest.approx(0.5, abs=0.02)
+    image = gallery.pages.currentWidget()
+    assert image.pixmap().width() <= gallery.pages.contentsRect().width()
+    assert image.pixmap().height() <= gallery.pages.contentsRect().height()
 
 
 def test_home_downloads_torrent_url_and_opens_file(
