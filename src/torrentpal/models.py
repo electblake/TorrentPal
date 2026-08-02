@@ -15,7 +15,6 @@ class MetadataTableModel(QAbstractTableModel):
             ("Info hash v2", metadata.info_hash_v2),
             ("Created", format_date(metadata.created)),
             ("Created by", metadata.creator),
-            ("Comment", metadata.comment),
             ("Piece size", format_size(metadata.piece_size)),
             ("Total size", format_size(metadata.total_size)),
         )

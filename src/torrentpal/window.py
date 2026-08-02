@@ -22,6 +22,7 @@ from torrentpal.parser import parse_torrent
 from torrentpal.widgets import (
     CollapsiblePanel,
     DropZone,
+    comment_browser,
     file_tree,
     metadata_table,
     tracker_table,
@@ -110,6 +111,10 @@ class MainWindow(QMainWindow):
         )
         details_layout.addWidget(table)
         layout.addWidget(details_group)
+        comment_group = QGroupBox("Comment")
+        comment_layout = QVBoxLayout(comment_group)
+        comment_layout.addWidget(comment_browser(metadata.comment))
+        layout.addWidget(comment_group)
         magnet_row = QHBoxLayout()
         magnet_label = QLabel("Magnet Link")
         copy_button = QPushButton("Copy")

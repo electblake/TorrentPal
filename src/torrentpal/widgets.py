@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QTableView,
+    QTextBrowser,
     QToolButton,
     QTreeView,
     QVBoxLayout,
@@ -81,6 +82,16 @@ def metadata_table() -> QTableView:
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     return view
+
+
+def comment_browser(comment: str) -> QTextBrowser:
+    browser = QTextBrowser()
+    browser.setObjectName("commentBrowser")
+    browser.setMarkdown(comment)
+    browser.setOpenExternalLinks(True)
+    browser.setAccessibleName("Torrent comment")
+    browser.setMinimumHeight(96)
+    return browser
 
 
 def tracker_table() -> QTableView:
