@@ -161,6 +161,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 10
     assert window.image_minimum_height.value() == 10
     assert window.torrent_images_maximum.value() == 10
+    assert window.click_all_hidden_contents.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
@@ -169,6 +170,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     window.image_minimum_width.setValue(320)
     window.image_minimum_height.setValue(180)
     window.torrent_images_maximum.setValue(6)
+    window.click_all_hidden_contents.setChecked(False)
     window.tag_selectors.setPlainText("#torrent_tags_list\n.tags")
     window.tag_minimum_link_text_length.setValue(4)
     window.tag_name_excludes.setPlainText("\\[-\\]\nignore")
@@ -178,6 +180,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert settings.value("image_minimum_width", type=int) == 320
     assert settings.value("image_minimum_height", type=int) == 180
     assert settings.value("torrent_images_maximum", type=int) == 6
+    assert not settings.value("click_all_hidden_contents", type=bool)
     assert settings.value("tag_selectors", type=str) == "#torrent_tags_list\n.tags"
     assert settings.value("tag_minimum_link_text_length", type=int) == 4
     assert settings.value("tag_name_excludes", type=str) == "\\[-\\]\nignore"
@@ -188,6 +191,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 320
     assert window.image_minimum_height.value() == 180
     assert window.torrent_images_maximum.value() == 6
+    assert not window.click_all_hidden_contents.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list\n.tags"
     assert window.tag_minimum_link_text_length.value() == 4
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\nignore"
@@ -196,6 +200,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 10
     assert window.image_minimum_height.value() == 10
     assert window.torrent_images_maximum.value() == 10
+    assert window.click_all_hidden_contents.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"

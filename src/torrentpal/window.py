@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
@@ -142,6 +143,9 @@ class MainWindow(QMainWindow):
         self.torrent_images_maximum.setObjectName("torrentImagesMaximum")
         self.torrent_images_maximum.setRange(1, 100)
         form.addRow("Torrent Images Max", self.torrent_images_maximum)
+        self.click_all_hidden_contents = QCheckBox()
+        self.click_all_hidden_contents.setObjectName("clickAllHiddenContents")
+        form.addRow("Click all hidden contents", self.click_all_hidden_contents)
         self.save_cookies_button = QPushButton("Save Cookies")
         self.save_cookies_button.clicked.connect(self._save_cookies)
         form.addRow("", self.save_cookies_button)
@@ -201,6 +205,9 @@ class MainWindow(QMainWindow):
         self.torrent_images_maximum.setValue(
             SETTINGS.value("torrent_images_maximum", 10, type=int)
         )
+        self.click_all_hidden_contents.setChecked(
+            SETTINGS.value("click_all_hidden_contents", True, type=bool)
+        )
         self.tag_selectors.setPlainText(
             SETTINGS.value("tag_selectors", "#torrent_tags_list", type=str)
         )
@@ -228,6 +235,9 @@ class MainWindow(QMainWindow):
         SETTINGS.setValue("image_minimum_width", self.image_minimum_width.value())
         SETTINGS.setValue("image_minimum_height", self.image_minimum_height.value())
         SETTINGS.setValue("torrent_images_maximum", self.torrent_images_maximum.value())
+        SETTINGS.setValue(
+            "click_all_hidden_contents", self.click_all_hidden_contents.isChecked()
+        )
         SETTINGS.setValue("tag_selectors", self.tag_selectors.toPlainText())
         SETTINGS.setValue(
             "tag_minimum_link_text_length",
@@ -242,6 +252,7 @@ class MainWindow(QMainWindow):
         SETTINGS.remove("image_minimum_width")
         SETTINGS.remove("image_minimum_height")
         SETTINGS.remove("torrent_images_maximum")
+        SETTINGS.remove("click_all_hidden_contents")
         SETTINGS.remove("tag_selectors")
         SETTINGS.remove("tag_minimum_link_text_length")
         SETTINGS.remove("tag_name_excludes")
@@ -251,6 +262,7 @@ class MainWindow(QMainWindow):
         self.image_minimum_width.setValue(10)
         self.image_minimum_height.setValue(10)
         self.torrent_images_maximum.setValue(10)
+        self.click_all_hidden_contents.setChecked(True)
         self.tag_selectors.setPlainText("#torrent_tags_list")
         self.tag_minimum_link_text_length.setValue(3)
         self.tag_name_excludes.setPlainText("\\[-\\]\n\\[N\\]")
@@ -376,6 +388,7 @@ class MainWindow(QMainWindow):
                 SETTINGS.value("image_minimum_width", 10, type=int),
                 SETTINGS.value("image_minimum_height", 10, type=int),
                 SETTINGS.value("torrent_images_maximum", 10, type=int),
+                SETTINGS.value("click_all_hidden_contents", True, type=bool),
                 self._show_fetch_status,
             )
             image_gallery.set_images(image_paths)

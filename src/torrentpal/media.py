@@ -41,6 +41,7 @@ def download_images(
     minimum_width: int,
     minimum_height: int,
     maximum_images: int,
+    click_all_hidden_contents: bool,
     report_status: Callable[[str], None],
 ) -> tuple[Path, ...]:
     report_status("Loading browser cookies")
@@ -91,6 +92,10 @@ def download_images(
         )
         report_status(f"Opening comment link: {page_url}")
         page.goto(page_url)
+        if click_all_hidden_contents:
+            report_status("Revealing hidden content")
+            for show_link in page.get_by_role("link", name="Show", exact=True).all():
+                show_link.click()
         report_status("Selecting qualifying images")
         images = page.locator("img").evaluate_all(
             """(images, settings) => [...new Map(images.map(image => ({
