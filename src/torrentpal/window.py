@@ -25,11 +25,24 @@ from PySide6.QtWidgets import (
 
 from torrentpal.config import DATA_DIR, SETTINGS
 from torrentpal.domain import TorrentMetadata
-from torrentpal.media import cached_images, download_images, download_tags, first_url
+from torrentpal.downloads import (
+    TorrentDownloadError,
+    download_torrent,
+    validate_torrent_url,
+)
+from torrentpal.media import (
+    CookieConfigurationError,
+    cached_images,
+    download_images,
+    download_tags,
+    first_url,
+    format_browser_cookie_json,
+)
 from torrentpal.models import FileTreeModel, MetadataTableModel, TrackerModel
 from torrentpal.parser import parse_torrent
 from torrentpal.widgets import (
     CollapsiblePanel,
+    DownloadedTorrentList,
     DropZone,
     ImageGallery,
     TagGrid,
@@ -80,8 +93,15 @@ class MainWindow(QMainWindow):
         self.drop_zone = DropZone()
         self.drop_zone.browse_button.clicked.connect(self._browse)
         self.drop_zone.file_selected.connect(self.open_torrent)
+        self.drop_zone.paste_requested.connect(self._paste_torrent_url)
+        self.drop_zone.url_requested.connect(self._download_and_open_torrent)
         layout.addWidget(self.drop_zone)
-        layout.addStretch()
+        layout.addSpacing(16)
+        self.downloaded_torrents = DownloadedTorrentList()
+        self.downloaded_torrents.open_requested.connect(self.open_torrent)
+        layout.addWidget(self.downloaded_torrents, stretch=1)
+        self._refresh_downloaded_torrents()
+        layout.addSpacing(16)
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self._open_settings)
         layout.addWidget(settings_button, alignment=Qt.AlignmentFlag.AlignRight)
@@ -91,7 +111,7 @@ class MainWindow(QMainWindow):
         page, layout = self._page()
         back = QPushButton("Back")
         back.setObjectName("settingsBackButton")
-        back.clicked.connect(lambda: self.stack.setCurrentWidget(self.input_page))
+        back.clicked.connect(self._show_input_page)
         layout.addWidget(back, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addSpacing(16)
         title = QLabel("Settings")
@@ -107,8 +127,8 @@ class MainWindow(QMainWindow):
         form = QFormLayout(images_browser_group)
         self.cookies_path = QLineEdit()
         self.cookies_path.setObjectName("cookiesFilePath")
-        self.cookies_path.setPlaceholderText("Path to browser cookies export")
-        form.addRow("Cookies file", self.cookies_path)
+        self.cookies_path.setPlaceholderText("Path to browser cookies JSON export")
+        form.addRow("Cookies JSON file", self.cookies_path)
         self.cookies_text = QTextEdit()
         self.cookies_text.setObjectName("cookiesText")
         self.cookies_text.setPlaceholderText("Paste exported browser cookies JSON")
@@ -184,16 +204,14 @@ class MainWindow(QMainWindow):
         )
         self.save_settings_button.clicked.connect(self._save_settings)
         self.reset_settings_button.clicked.connect(self._reset_settings)
-        self.cancel_settings_button.clicked.connect(
-            lambda: self.stack.setCurrentWidget(self.input_page)
-        )
+        self.cancel_settings_button.clicked.connect(self._show_input_page)
         layout.addWidget(buttons)
         layout.addStretch()
         return page
 
     def _open_settings(self) -> None:
         cookies_file = SETTINGS.value(
-            "cookies_file", str(DATA_DIR / "cookies.txt"), type=str
+            "cookies_file", str(DATA_DIR / "cookies.json"), type=str
         )
         self.cookies_path.setText(cookies_file)
         self.image_minimum_width.setValue(
@@ -223,12 +241,24 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.settings_page)
 
     def _save_cookies(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        cookies_file = DATA_DIR / "cookies.txt"
-        cookies_file.write_text(self.cookies_text.toPlainText(), encoding="utf-8")
+        configured_path = self.cookies_path.text().strip()
+        cookies_file = (
+            Path(configured_path) if configured_path else DATA_DIR / "cookies.json"
+        )
+        contents = self.cookies_text.toPlainText()
+        contents_to_save = contents if contents.strip() else "[]"
+        try:
+            formatted_json = format_browser_cookie_json(contents_to_save)
+        except CookieConfigurationError as error:
+            self._show_fetch_status(f"Cookies not saved: {error}")
+            return
+        cookies_file.parent.mkdir(parents=True, exist_ok=True)
+        cookies_file.write_text(formatted_json, encoding="utf-8")
+        self.cookies_text.setPlainText(formatted_json)
         self.cookies_path.setText(str(cookies_file))
         SETTINGS.setValue("cookies_file", str(cookies_file))
         SETTINGS.sync()
+        self._show_fetch_status("Browser cookies saved")
 
     def _save_settings(self) -> None:
         SETTINGS.setValue("cookies_file", self.cookies_path.text())
@@ -245,7 +275,7 @@ class MainWindow(QMainWindow):
         )
         SETTINGS.setValue("tag_name_excludes", self.tag_name_excludes.toPlainText())
         SETTINGS.sync()
-        self.stack.setCurrentWidget(self.input_page)
+        self._show_input_page()
 
     def _reset_settings(self) -> None:
         SETTINGS.remove("cookies_file")
@@ -275,9 +305,89 @@ class MainWindow(QMainWindow):
 
     def open_torrent(self, path: Path) -> None:
         metadata = parse_torrent(path)
+        self._show_metadata(metadata)
+
+    def _show_metadata(self, metadata: TorrentMetadata) -> None:
         results = self._build_results_page(metadata)
         self.stack.addWidget(results)
         self.stack.setCurrentWidget(results)
+
+    def _torrent_directory(self) -> Path:
+        return DATA_DIR / "torrents"
+
+    def _refresh_downloaded_torrents(self) -> None:
+        torrent_directory = self._torrent_directory()
+        entries: list[tuple[Path, str]] = []
+        if torrent_directory.exists():
+            paths = sorted(
+                torrent_directory.glob("*.torrent"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for path in paths:
+                try:
+                    metadata = parse_torrent(path)
+                except Exception:
+                    continue
+                entries.append((path, metadata.name))
+        self.downloaded_torrents.set_torrents(tuple(entries))
+
+    def _show_input_page(self) -> None:
+        self._refresh_downloaded_torrents()
+        self.stack.setCurrentWidget(self.input_page)
+
+    def _store_downloaded_torrent(
+        self, downloaded_path: Path, metadata: TorrentMetadata
+    ) -> Path:
+        torrent_hash = metadata.info_hash_v1 or metadata.info_hash_v2
+        stored_path = self._torrent_directory() / f"{torrent_hash}.torrent"
+        if stored_path.exists():
+            downloaded_path.unlink(missing_ok=True)
+        else:
+            downloaded_path.replace(stored_path)
+        return stored_path
+
+    def _paste_torrent_url(self) -> None:
+        try:
+            url = validate_torrent_url(QApplication.clipboard().text())
+        except TorrentDownloadError:
+            self._show_torrent_url_status(
+                "Clipboard does not contain a valid HTTP or HTTPS URL"
+            )
+            return
+        self.drop_zone.url_input.setText(url)
+        self.drop_zone.url_input.setFocus()
+        self._show_torrent_url_status("Torrent URL pasted from clipboard")
+
+    def _download_and_open_torrent(self, url: str) -> None:
+        self.drop_zone.set_downloading(True)
+        self._show_torrent_url_status("Downloading torrent…")
+        downloaded_path: Path | None = None
+        try:
+            torrent_directory = self._torrent_directory()
+            torrent_directory.mkdir(parents=True, exist_ok=True)
+            downloaded_path = download_torrent(url, torrent_directory)
+            self._show_torrent_url_status("Download complete; loading torrent…")
+            metadata = parse_torrent(downloaded_path)
+            self._store_downloaded_torrent(downloaded_path, metadata)
+            self._refresh_downloaded_torrents()
+            self._show_metadata(metadata)
+        except Exception as error:
+            if downloaded_path is not None:
+                downloaded_path.unlink(missing_ok=True)
+            self._show_torrent_url_status(
+                f"Could not download and load torrent: {error}"
+            )
+        else:
+            self.drop_zone.url_input.clear()
+            self._show_torrent_url_status("Torrent downloaded and loaded")
+        finally:
+            self.drop_zone.set_downloading(False)
+
+    def _show_torrent_url_status(self, message: str) -> None:
+        self.drop_zone.set_url_status(message)
+        self.statusBar().showMessage(message)
+        QApplication.processEvents()
 
     def _build_results_page(self, metadata: TorrentMetadata) -> QWidget:
         page, outer = self._page()
@@ -289,7 +399,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(16)
         back = QPushButton("Back")
-        back.clicked.connect(lambda: self.stack.setCurrentWidget(self.input_page))
+        back.clicked.connect(self._show_input_page)
         layout.addWidget(back, alignment=Qt.AlignmentFlag.AlignLeft)
         heading = QLabel(metadata.name)
         heading_font = QFont(heading.font())
@@ -376,7 +486,7 @@ class MainWindow(QMainWindow):
         image_gallery.set_fetching(True)
         self._show_fetch_status("Preparing image fetch")
         cookies_file = Path(
-            SETTINGS.value("cookies_file", str(DATA_DIR / "cookies.txt"), type=str)
+            SETTINGS.value("cookies_file", str(DATA_DIR / "cookies.json"), type=str)
         )
         torrent_hash = metadata.info_hash_v1 or metadata.info_hash_v2
         try:
@@ -395,7 +505,6 @@ class MainWindow(QMainWindow):
             self._show_fetch_status(f"Fetched and cached {len(image_paths)} images")
         except Exception as error:
             self._show_fetch_status(f"Image fetch failed: {error}")
-            raise
         finally:
             image_gallery.set_fetching(False)
 
@@ -406,24 +515,30 @@ class MainWindow(QMainWindow):
     def _load_tags(self, metadata: TorrentMetadata, tag_grid: TagGrid) -> None:
         tag_grid.set_fetching(True)
         self._show_fetch_status("Preparing tag fetch")
-        tags = download_tags(
-            first_url(metadata.comment),
-            Path(
-                SETTINGS.value("cookies_file", str(DATA_DIR / "cookies.txt"), type=str)
-            ),
-            tuple(
-                SETTINGS.value(
-                    "tag_selectors", "#torrent_tags_list", type=str
-                ).splitlines()
-            ),
-            SETTINGS.value("tag_minimum_link_text_length", 3, type=int),
-            tuple(
-                SETTINGS.value(
-                    "tag_name_excludes", "\\[-\\]\n\\[N\\]", type=str
-                ).splitlines()
-            ),
-            self._show_fetch_status,
-        )
-        tag_grid.set_tags(tags)
-        self._show_fetch_status(f"Fetched {len(tags)} tags")
-        tag_grid.set_fetching(False)
+        try:
+            tags = download_tags(
+                first_url(metadata.comment),
+                Path(
+                    SETTINGS.value(
+                        "cookies_file", str(DATA_DIR / "cookies.json"), type=str
+                    )
+                ),
+                tuple(
+                    SETTINGS.value(
+                        "tag_selectors", "#torrent_tags_list", type=str
+                    ).splitlines()
+                ),
+                SETTINGS.value("tag_minimum_link_text_length", 3, type=int),
+                tuple(
+                    SETTINGS.value(
+                        "tag_name_excludes", "\\[-\\]\n\\[N\\]", type=str
+                    ).splitlines()
+                ),
+                self._show_fetch_status,
+            )
+            tag_grid.set_tags(tags)
+            self._show_fetch_status(f"Fetched {len(tags)} tags")
+        except Exception as error:
+            self._show_fetch_status(f"Tag fetch failed: {error}")
+        finally:
+            tag_grid.set_fetching(False)

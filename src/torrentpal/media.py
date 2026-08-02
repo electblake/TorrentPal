@@ -1,11 +1,88 @@
 import json
 import re
 from collections.abc import Callable
+from json import JSONDecodeError
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 from torrentpal.domain import Tag
+
+
+class CookieConfigurationError(ValueError):
+    """Raised when a browser cookie export cannot be parsed."""
+
+
+def parse_browser_cookies(contents: str) -> list[dict[str, object]]:
+    """Convert a JSON browser-cookie export for Playwright."""
+    cookies_export = _validated_cookie_export(contents)
+    return [
+        _playwright_cookie(exported_cookie, index)
+        for index, exported_cookie in enumerate(cookies_export, start=1)
+    ]
+
+
+def format_browser_cookie_json(contents: str) -> str:
+    """Validate and format a browser-cookie export as canonical JSON."""
+    return json.dumps(_validated_cookie_export(contents), indent=2)
+
+
+def _validated_cookie_export(contents: str) -> list[object]:
+    contents = contents.lstrip("\ufeff")
+    if not contents.strip():
+        raise CookieConfigurationError("Cookies JSON cannot be empty; use [] for none")
+    try:
+        cookies_export = json.loads(contents)
+    except JSONDecodeError as error:
+        raise CookieConfigurationError("Cookies must be valid JSON") from error
+    if not isinstance(cookies_export, list):
+        raise CookieConfigurationError("A JSON cookies export must contain a list")
+    for index, exported_cookie in enumerate(cookies_export, start=1):
+        _playwright_cookie(exported_cookie, index)
+    return cookies_export
+
+
+def load_browser_cookies(cookies_path: Path) -> list[dict[str, object]]:
+    """Load optional browser cookies from disk without exposing their values."""
+    if not cookies_path.exists():
+        return []
+    return parse_browser_cookies(cookies_path.read_text(encoding="utf-8"))
+
+
+def _playwright_cookie(exported_cookie: object, index: int) -> dict[str, object]:
+    if not isinstance(exported_cookie, dict):
+        raise CookieConfigurationError(f"Cookie {index} must be a JSON object")
+    required_fields = ("name", "value", "domain", "path")
+    missing_fields = [
+        field for field in required_fields if field not in exported_cookie
+    ]
+    if missing_fields:
+        raise CookieConfigurationError(
+            f"Cookie {index} is missing required fields: {', '.join(missing_fields)}"
+        )
+
+    cookie: dict[str, object] = {
+        field: str(exported_cookie[field]) for field in required_fields
+    }
+    cookie["httpOnly"] = bool(exported_cookie.get("httpOnly", False))
+    cookie["secure"] = bool(exported_cookie.get("secure", False))
+    expiration = exported_cookie.get("expirationDate")
+    if isinstance(expiration, int | float) and expiration > 0:
+        cookie["expires"] = float(expiration)
+    same_site = str(exported_cookie.get("sameSite", "unspecified")).lower()
+    if same_site != "unspecified":
+        same_site_value = {
+            "strict": "Strict",
+            "lax": "Lax",
+            "no_restriction": "None",
+            "none": "None",
+        }.get(same_site)
+        if same_site_value is None:
+            raise CookieConfigurationError(
+                f"Cookie {index} has an unsupported sameSite value"
+            )
+        cookie["sameSite"] = same_site_value
+    return cookie
 
 
 def first_url(comment: str) -> str:
@@ -45,32 +122,15 @@ def download_images(
     report_status: Callable[[str], None],
 ) -> tuple[Path, ...]:
     report_status("Loading browser cookies")
-    cookies_export = json.loads(cookies_path.read_text(encoding="utf-8"))
-    cookies = []
-    for exported_cookie in cookies_export:
-        cookie = {
-            "name": exported_cookie["name"],
-            "value": exported_cookie["value"],
-            "domain": exported_cookie["domain"],
-            "path": exported_cookie["path"],
-            "httpOnly": exported_cookie["httpOnly"],
-            "secure": exported_cookie["secure"],
-        }
-        if "expirationDate" in exported_cookie:
-            cookie["expires"] = exported_cookie["expirationDate"]
-        if exported_cookie["sameSite"] != "unspecified":
-            cookie["sameSite"] = {
-                "strict": "Strict",
-                "lax": "Lax",
-                "no_restriction": "None",
-            }[exported_cookie["sameSite"]]
-        cookies.append(cookie)
+    cookies = load_browser_cookies(cookies_path)
+    report_status(f"Loaded {len(cookies)} browser cookies")
 
     with sync_playwright() as playwright:
         report_status("Starting headless browser")
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context()
-        context.add_cookies(cookies)
+        if cookies:
+            context.add_cookies(cookies)
         page = context.new_page()
         responses = {}
 
@@ -91,11 +151,20 @@ def download_images(
             ),
         )
         report_status(f"Opening comment link: {page_url}")
-        page.goto(page_url)
+        page.goto(page_url, wait_until="domcontentloaded")
         if click_all_hidden_contents:
             report_status("Revealing hidden content")
-            for show_link in page.get_by_role("link", name="Show", exact=True).all():
-                show_link.click()
+            show_links = page.get_by_role("link", name="Show", exact=True)
+            revealed_sections = 0
+            while show_links.count():
+                links_before_click = show_links.count()
+                show_links.first.click()
+                revealed_sections += 1
+                if revealed_sections > 1000:
+                    raise RuntimeError("Too many hidden content sections to reveal")
+                if show_links.count() >= links_before_click:
+                    raise RuntimeError("A Show link did not reveal its hidden content")
+            report_status(f"Revealed {revealed_sections} hidden content sections")
         report_status("Selecting qualifying images")
         images = page.locator("img").evaluate_all(
             """(images, settings) => [...new Map(images.map(image => ({
@@ -143,35 +212,18 @@ def download_tags(
     report_status: Callable[[str], None],
 ) -> tuple[Tag, ...]:
     report_status("Loading browser cookies")
-    cookies_export = json.loads(cookies_path.read_text(encoding="utf-8"))
-    cookies = []
-    for exported_cookie in cookies_export:
-        cookie = {
-            "name": exported_cookie["name"],
-            "value": exported_cookie["value"],
-            "domain": exported_cookie["domain"],
-            "path": exported_cookie["path"],
-            "httpOnly": exported_cookie["httpOnly"],
-            "secure": exported_cookie["secure"],
-        }
-        if "expirationDate" in exported_cookie:
-            cookie["expires"] = exported_cookie["expirationDate"]
-        if exported_cookie["sameSite"] != "unspecified":
-            cookie["sameSite"] = {
-                "strict": "Strict",
-                "lax": "Lax",
-                "no_restriction": "None",
-            }[exported_cookie["sameSite"]]
-        cookies.append(cookie)
+    cookies = load_browser_cookies(cookies_path)
+    report_status(f"Loaded {len(cookies)} browser cookies")
 
     with sync_playwright() as playwright:
         report_status("Starting headless browser")
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context()
-        context.add_cookies(cookies)
+        if cookies:
+            context.add_cookies(cookies)
         page = context.new_page()
         report_status(f"Opening comment link: {page_url}")
-        page.goto(page_url)
+        page.goto(page_url, wait_until="domcontentloaded")
         report_status("Selecting qualifying tags")
         links = page.locator(", ".join(f"{selector} a" for selector in selectors))
         candidates = links.evaluate_all(

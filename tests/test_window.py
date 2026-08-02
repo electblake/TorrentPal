@@ -1,9 +1,9 @@
+import json
 from pathlib import Path
 
-import pytest
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QMovie, QPixmap
-from PySide6.QtWidgets import QGroupBox, QLabel, QPushButton, QTextBrowser
+from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QPushButton, QTextBrowser
 
 import torrentpal.window
 from torrentpal.domain import Tag
@@ -27,6 +27,136 @@ def test_window_opens_torrent(qtbot) -> None:
     assert window.findChild(QPushButton, "fetchTagsButton").text() == "Fetch Tags"
     assert window.findChild(QPushButton, "fetchImageButton").text() == "Fetch Image"
     assert window.statusBar().currentMessage() == "Ready"
+
+
+def test_home_downloads_torrent_url_and_opens_file(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    requested_url = (
+        "https://tracker.example/download.php?id=42&authkey=secret&torrent_pass=pass"
+    )
+    downloaded_paths = []
+
+    def fetch_torrent(url, destination_directory):
+        assert url == requested_url
+        downloaded_path = destination_directory / "downloaded.torrent"
+        downloaded_path.write_bytes(FIXTURE.read_bytes())
+        downloaded_paths.append(downloaded_path)
+        return downloaded_path
+
+    monkeypatch.setattr(torrentpal.window, "download_torrent", fetch_torrent)
+    window.drop_zone.url_input.setText(requested_url)
+
+    assert window.drop_zone.download_button.isEnabled()
+    qtbot.mouseClick(window.drop_zone.download_button, Qt.MouseButton.LeftButton)
+
+    assert window.stack.currentWidget() is not window.input_page
+    assert window.statusBar().currentMessage() == "Torrent downloaded and loaded"
+    assert window.drop_zone.url_status.text() == "Torrent downloaded and loaded"
+    assert window.drop_zone.url_input.text() == ""
+    assert not window.drop_zone.download_button.isEnabled()
+    assert not downloaded_paths[0].exists()
+    stored_paths = tuple((tmp_path / "torrents").glob("*.torrent"))
+    assert len(stored_paths) == 1
+    assert stored_paths[0].read_bytes() == FIXTURE.read_bytes()
+    assert window.downloaded_torrents.list.count() == 1
+
+
+def test_home_lists_saved_torrents_and_click_loads_them(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    torrent_directory = tmp_path / "torrents"
+    torrent_directory.mkdir()
+    saved_torrent = torrent_directory / "saved.torrent"
+    saved_torrent.write_bytes(FIXTURE.read_bytes())
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    item = window.downloaded_torrents.list.item(0)
+
+    assert window.downloaded_torrents.list.count() == 1
+    assert item.text() == torrentpal.window.parse_torrent(FIXTURE).name
+    assert item.toolTip() == str(saved_torrent)
+
+    window.downloaded_torrents.list.itemClicked.emit(item)
+
+    assert window.stack.currentWidget() is not window.input_page
+    assert window.findChild(QTextBrowser, "commentBrowser") is not None
+
+
+def test_home_refreshes_downloaded_torrents_when_returning(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    assert window.downloaded_torrents.list.count() == 0
+
+    torrent_directory = tmp_path / "torrents"
+    torrent_directory.mkdir()
+    (torrent_directory / "new.torrent").write_bytes(FIXTURE.read_bytes())
+
+    window._show_input_page()
+
+    assert window.downloaded_torrents.list.count() == 1
+
+
+def test_home_reports_torrent_url_download_error(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    def fail_download(url, destination_directory):
+        raise RuntimeError("Server returned HTTP 403: Forbidden")
+
+    monkeypatch.setattr(torrentpal.window, "download_torrent", fail_download)
+    window.drop_zone.url_input.setText(
+        "https://tracker.example/download.php?authkey=secret"
+    )
+
+    qtbot.mouseClick(window.drop_zone.download_button, Qt.MouseButton.LeftButton)
+
+    expected_status = (
+        "Could not download and load torrent: Server returned HTTP 403: Forbidden"
+    )
+    assert window.stack.currentWidget() is window.input_page
+    assert window.statusBar().currentMessage() == expected_status
+    assert window.drop_zone.url_status.text() == expected_status
+    assert window.drop_zone.url_input.isEnabled()
+    assert window.drop_zone.download_button.isEnabled()
+
+
+def test_home_pastes_valid_torrent_url_from_clipboard(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    clipboard_url = (
+        "https://tracker.example/download.php?id=42&authkey=secret&torrent_pass=pass"
+    )
+    QApplication.clipboard().setText(f"  {clipboard_url}  ")
+
+    qtbot.mouseClick(window.drop_zone.paste_button, Qt.MouseButton.LeftButton)
+
+    assert window.drop_zone.url_input.text() == clipboard_url
+    assert window.drop_zone.download_button.isEnabled()
+    assert window.drop_zone.url_status.text() == "Torrent URL pasted from clipboard"
+
+
+def test_home_rejects_invalid_clipboard_text_without_replacing_url(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    existing_url = "https://tracker.example/original.torrent?authkey=secret"
+    window.drop_zone.url_input.setText(existing_url)
+    QApplication.clipboard().setText("not a URL")
+
+    qtbot.mouseClick(window.drop_zone.paste_button, Qt.MouseButton.LeftButton)
+
+    assert window.drop_zone.url_input.text() == existing_url
+    assert window.drop_zone.url_status.text() == (
+        "Clipboard does not contain a valid HTTP or HTTPS URL"
+    )
 
 
 def test_window_loads_cached_image(qtbot, tmp_path, monkeypatch) -> None:
@@ -110,8 +240,7 @@ def test_image_fetch_reports_errors(qtbot, monkeypatch) -> None:
 
     monkeypatch.setattr(torrentpal.window, "download_images", fail_fetch)
 
-    with pytest.raises(RuntimeError, match="browser stopped"):
-        window._load_images(torrentpal.window.parse_torrent(FIXTURE), gallery)
+    window._load_images(torrentpal.window.parse_torrent(FIXTURE), gallery)
 
     assert gallery.load_button.text() == "Fetch Image"
     assert gallery.load_button.isEnabled()
@@ -165,7 +294,9 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
-    assert window.cookies_path.text() == str(torrentpal.window.DATA_DIR / "cookies.txt")
+    assert window.cookies_path.text() == str(
+        torrentpal.window.DATA_DIR / "cookies.json"
+    )
     window.cookies_path.setText("C:/cookies.txt")
     window.image_minimum_width.setValue(320)
     window.image_minimum_height.setValue(180)
@@ -256,9 +387,67 @@ def test_save_cookies_writes_default_data_file(qtbot, tmp_path, monkeypatch) -> 
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
     window = MainWindow()
     qtbot.addWidget(window)
-    window.cookies_text.setPlainText('[{"name": "sid"}]')
+    contents = (
+        '[{"name": "sid", "value": "value", "domain": "example.com", "path": "/"}]'
+    )
+    window.cookies_text.setPlainText(contents)
 
     qtbot.mouseClick(window.save_cookies_button, Qt.MouseButton.LeftButton)
 
-    assert (tmp_path / "cookies.txt").read_text(encoding="utf-8") == '[{"name": "sid"}]'
-    assert settings.value("cookies_file", type=str) == str(tmp_path / "cookies.txt")
+    saved_contents = (tmp_path / "cookies.json").read_text(encoding="utf-8")
+    assert json.loads(saved_contents) == json.loads(contents)
+    assert settings.value("cookies_file", type=str) == str(tmp_path / "cookies.json")
+
+
+def test_save_cookies_writes_valid_empty_export(qtbot, tmp_path, monkeypatch) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    qtbot.mouseClick(window.save_cookies_button, Qt.MouseButton.LeftButton)
+
+    assert (tmp_path / "cookies.json").read_text(encoding="utf-8") == "[]"
+    assert window.statusBar().currentMessage() == "Browser cookies saved"
+
+
+def test_save_cookies_honors_configured_path_and_json_format(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    cookies_file = tmp_path / "exports" / "cookies.json"
+    contents = (
+        '[{"name":"session","value":"secret","domain":".example.com",'
+        '"path":"/","secure":true}]'
+    )
+    window.cookies_path.setText(str(cookies_file))
+    window.cookies_text.setPlainText(contents)
+
+    qtbot.mouseClick(window.save_cookies_button, Qt.MouseButton.LeftButton)
+
+    assert json.loads(cookies_file.read_text(encoding="utf-8")) == json.loads(contents)
+    assert settings.value("cookies_file", type=str) == str(cookies_file)
+    assert window.statusBar().currentMessage() == "Browser cookies saved"
+
+
+def test_save_cookies_rejects_malformed_content_without_overwriting(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    cookies_file = tmp_path / "cookies.json"
+    cookies_file.write_text("[]", encoding="utf-8")
+    window.cookies_path.setText(str(cookies_file))
+    window.cookies_text.setPlainText("# Netscape HTTP Cookie File\n")
+
+    qtbot.mouseClick(window.save_cookies_button, Qt.MouseButton.LeftButton)
+
+    assert cookies_file.read_text(encoding="utf-8") == "[]"
+    assert not settings.contains("cookies_file")
+    assert window.statusBar().currentMessage().startswith("Cookies not saved:")
