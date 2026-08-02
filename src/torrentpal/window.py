@@ -4,10 +4,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
@@ -16,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from torrentpal.config import SETTINGS
 from torrentpal.domain import TorrentMetadata
 from torrentpal.models import FileTreeModel, MetadataTableModel, TrackerModel
 from torrentpal.parser import parse_torrent
@@ -39,6 +43,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
         self.input_page = self._build_input_page()
         self.stack.addWidget(self.input_page)
+        self.settings_page = self._build_settings_page()
+        self.stack.addWidget(self.settings_page)
 
     def _page(self) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
@@ -67,7 +73,63 @@ class MainWindow(QMainWindow):
         self.drop_zone.file_selected.connect(self.open_torrent)
         layout.addWidget(self.drop_zone)
         layout.addStretch()
+        settings_button = QPushButton("Settings")
+        settings_button.clicked.connect(self._open_settings)
+        layout.addWidget(settings_button, alignment=Qt.AlignmentFlag.AlignRight)
         return page
+
+    def _build_settings_page(self) -> QWidget:
+        page, layout = self._page()
+        title = QLabel("Settings")
+        title_font = QFont(title.font())
+        title_font.setPointSize(title_font.pointSize() + 4)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        title.setFont(title_font)
+        layout.addWidget(title)
+        layout.addSpacing(16)
+
+        form = QFormLayout()
+        self.cookies_path = QLineEdit()
+        self.cookies_path.setObjectName("cookiesFilePath")
+        self.cookies_path.setPlaceholderText("Path to browser cookies export")
+        form.addRow("Cookies file", self.cookies_path)
+        layout.addLayout(form)
+        layout.addSpacing(16)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Reset
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.save_settings_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self.reset_settings_button = buttons.button(
+            QDialogButtonBox.StandardButton.Reset
+        )
+        self.cancel_settings_button = buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        self.save_settings_button.clicked.connect(self._save_settings)
+        self.reset_settings_button.clicked.connect(self._reset_settings)
+        self.cancel_settings_button.clicked.connect(
+            lambda: self.stack.setCurrentWidget(self.input_page)
+        )
+        layout.addWidget(buttons)
+        layout.addStretch()
+        return page
+
+    def _open_settings(self) -> None:
+        self.cookies_path.setText(SETTINGS.value("cookies_file", type=str))
+        self.stack.setCurrentWidget(self.settings_page)
+
+    def _save_settings(self) -> None:
+        SETTINGS.setValue("cookies_file", self.cookies_path.text())
+        SETTINGS.sync()
+        self.stack.setCurrentWidget(self.input_page)
+
+    def _reset_settings(self) -> None:
+        SETTINGS.remove("cookies_file")
+        SETTINGS.sync()
+        self.cookies_path.clear()
 
     def _browse(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(

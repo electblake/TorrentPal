@@ -20,3 +20,8 @@ Thumbs.db
 Desktop.ini
 
 node_modules/
+.ruff_cache/
+.pytest_cache/
+data/
+uv.lock
+.vscode/

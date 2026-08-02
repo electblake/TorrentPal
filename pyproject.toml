@@ -5,6 +5,7 @@ description = ""
 requires-python = ">=3.12"
 dependencies = [
     "libtorrent>=2.0.13",
+    "platformdirs>=4.11.0",
     "pyside6>=6.11.1",
 ]
 
