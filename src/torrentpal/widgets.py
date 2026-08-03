@@ -17,23 +17,123 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QTableView,
     QTextBrowser,
     QToolButton,
     QTreeView,
-    QTreeWidget,
-    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from torrentpal.domain import Tag
+from torrentpal.domain import Tag, TorrentLibraryEntry
+from torrentpal.formatting import format_size
+
+
+class TorrentFileListItem(QListWidgetItem):
+    def __init__(self, entry: TorrentLibraryEntry) -> None:
+        super().__init__(entry.display_name)
+        self.entry = entry
+        self.setData(Qt.ItemDataRole.UserRole, str(entry.path))
+        self.setData(
+            Qt.ItemDataRole.AccessibleTextRole,
+            f"{entry.display_name}, {entry.cached_image_count} cached images",
+        )
+        self.setToolTip(str(entry.path))
+
+
+class TorrentFileListItemWidget(QWidget):
+    def __init__(self, entry: TorrentLibraryEntry) -> None:
+        super().__init__()
+        self.setObjectName("torrentFileListItem")
+        self.setAccessibleName(entry.display_name)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout = QGridLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(2)
+
+        self.name_label = QLabel(entry.display_name)
+        self.name_label.setObjectName("torrentFileName")
+        name_font = self.name_label.font()
+        name_font.setBold(True)
+        self.name_label.setFont(name_font)
+        self.name_label.setToolTip(str(entry.path))
+        self.name_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        layout.addWidget(self.name_label, 0, 0)
+
+        image_noun = "image" if entry.cached_image_count == 1 else "images"
+        self.cached_images_label = QLabel(
+            f"{entry.cached_image_count} cached {image_noun}"
+        )
+        self.cached_images_label.setObjectName("torrentCachedImages")
+        layout.addWidget(
+            self.cached_images_label,
+            0,
+            1,
+            alignment=Qt.AlignmentFlag.AlignRight,
+        )
+
+        if entry.total_size is None:
+            details = "Metadata scan disabled"
+        else:
+            file_noun = "file" if entry.file_count == 1 else "files"
+            tracker_noun = "tracker" if entry.tracker_count == 1 else "trackers"
+            details = (
+                f"{format_size(entry.total_size)} · "
+                f"{entry.file_count} {file_noun} · "
+                f"{entry.tracker_count} {tracker_noun}"
+            )
+        self.details_label = QLabel(details)
+        self.details_label.setObjectName("torrentFileDetails")
+        self.details_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        layout.addWidget(self.details_label, 1, 0)
+
+        self.metadata_cache_label = QLabel(
+            "Metadata cached" if entry.metadata_cached else "No metadata cache"
+        )
+        self.metadata_cache_label.setObjectName("torrentMetadataCacheStatus")
+        layout.addWidget(
+            self.metadata_cache_label,
+            1,
+            1,
+            alignment=Qt.AlignmentFlag.AlignRight,
+        )
+
+
+class TorrentFileList(QListWidget):
+    open_requested = Signal(Path)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("torrentsList")
+        self.setAccessibleName("Torrents")
+        self.setAccessibleDescription("Select a torrent to open its metadata")
+        self.setAlternatingRowColors(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.itemClicked.connect(self._open_item)
+
+    def add_entry(self, entry: TorrentLibraryEntry) -> None:
+        item = TorrentFileListItem(entry)
+        self.addItem(item)
+        item_widget = TorrentFileListItemWidget(entry)
+        item.setSizeHint(item_widget.sizeHint())
+        self.setItemWidget(item, item_widget)
+
+    def _open_item(self, item: TorrentFileListItem) -> None:
+        self.open_requested.emit(item.entry.path)
 
 
 class TorrentList(QGroupBox):
@@ -46,21 +146,9 @@ class TorrentList(QGroupBox):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(4)
 
-        self.table = QTreeWidget()
-        self.table.setObjectName("torrentsTable")
-        self.table.setAccessibleName("Torrents")
-        self.table.setAccessibleDescription("Select a torrent to open its metadata")
-        self.table.setColumnCount(2)
-        self.table.setHeaderLabels(("Torrent", "Cached Images"))
-        self.table.setRootIsDecorated(False)
-        self.table.setAlternatingRowColors(True)
-        self.table.setUniformRowHeights(True)
-        header = self.table.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.table.itemClicked.connect(self._open_item)
-        layout.addWidget(self.table)
+        self.list = TorrentFileList()
+        self.list.open_requested.connect(self.open_requested)
+        layout.addWidget(self.list)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("torrentLoadingProgress")
@@ -88,8 +176,8 @@ class TorrentList(QGroupBox):
 
     def begin_loading(self) -> None:
         self._is_loading = True
-        self.table.clear()
-        self.table.show()
+        self.list.clear()
+        self.list.show()
         self.empty_label.hide()
         self.load_status.hide()
         self.progress_bar.setRange(0, 0)
@@ -101,43 +189,43 @@ class TorrentList(QGroupBox):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Loading torrents… %v / %m")
 
-    def add_torrent(
-        self, path: Path, display_name: str, cached_image_total: int
-    ) -> None:
-        item = QTreeWidgetItem([display_name, str(cached_image_total)])
-        item.setData(0, Qt.ItemDataRole.UserRole, str(path))
-        item.setToolTip(0, str(path))
-        item.setToolTip(1, f"{cached_image_total} cached images")
-        item.setTextAlignment(
-            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self.table.addTopLevelItem(item)
+    def set_loading_item(self, file_name: str) -> None:
+        escaped_name = file_name.replace("%", "%%")
+        self.progress_bar.setFormat(f"Scanning {escaped_name} — %v / %m")
+
+    def add_torrent(self, entry: TorrentLibraryEntry) -> None:
+        self.list.add_entry(entry)
 
     def set_loading_progress(self, processed: int, total: int) -> None:
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(processed)
 
-    def finish_loading(self, unreadable_count: int, error_message: str) -> None:
+    def finish_loading(
+        self,
+        unreadable_count: int,
+        cache_failure_count: int,
+        error_message: str,
+    ) -> None:
         self._is_loading = False
         self.progress_bar.hide()
-        self.table.resizeColumnToContents(1)
-        has_torrents = self.table.topLevelItemCount() > 0
-        self.table.setVisible(has_torrents)
+        has_torrents = self.list.count() > 0
+        self.list.setVisible(has_torrents)
         self.empty_label.setVisible(not has_torrents)
+        messages = []
         if error_message:
-            self.load_status.setText(f"Could not load torrents: {error_message}")
-        elif unreadable_count:
+            messages.append(f"Could not load torrents: {error_message}")
+        if unreadable_count:
             noun = "file" if unreadable_count == 1 else "files"
-            self.load_status.setText(
+            messages.append(
                 f"Skipped {unreadable_count} unreadable torrent {noun}."
             )
-        else:
-            self.load_status.clear()
+        if cache_failure_count:
+            noun = "cache" if cache_failure_count == 1 else "caches"
+            messages.append(
+                f"Could not update {cache_failure_count} metadata {noun}."
+            )
+        self.load_status.setText(" ".join(messages))
         self.load_status.setVisible(bool(self.load_status.text()))
-
-    def _open_item(self, item: QTreeWidgetItem, column: int) -> None:
-        del column
-        self.open_requested.emit(Path(item.data(0, Qt.ItemDataRole.UserRole)))
 
 
 class TagGrid(QWidget):

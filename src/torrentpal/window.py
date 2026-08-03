@@ -1,7 +1,7 @@
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, Slot
 from PySide6.QtGui import QCloseEvent, QFont, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,7 +31,7 @@ from torrentpal.config import (
     DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS,
     SETTINGS,
 )
-from torrentpal.domain import TorrentMetadata
+from torrentpal.domain import TorrentLibraryEntry, TorrentMetadata
 from torrentpal.downloads import (
     TorrentDownloadError,
     download_torrent,
@@ -45,9 +45,14 @@ from torrentpal.media import (
     first_url,
     format_browser_cookie_json,
 )
+from torrentpal.metadata_cache import (
+    MetadataCacheError,
+    load_cached_metadata,
+    save_cached_metadata,
+)
 from torrentpal.models import FileTreeModel, MetadataTableModel, TrackerModel
 from torrentpal.parser import parse_torrent
-from torrentpal.torrent_loader import TorrentLoader
+from torrentpal.torrent_loader import MetadataReloadWorker, TorrentLoader
 from torrentpal.widgets import (
     CollapsiblePanel,
     DropZone,
@@ -91,6 +96,11 @@ class MainWindow(QMainWindow):
         self._torrent_scan_generation = 0
         self._torrent_scan_threads: set[QThread] = set()
         self._torrent_loaders: dict[QThread, TorrentLoader] = {}
+        self._metadata_reload_threads: set[QThread] = set()
+        self._metadata_reload_workers: dict[QThread, MetadataReloadWorker] = {}
+        self._metadata_reload_contexts: dict[
+            MetadataReloadWorker, tuple[Path, QWidget, QPushButton]
+        ] = {}
         self.input_page = self._build_input_page()
         self.stack.addWidget(self.input_page)
         self.settings_page = self._build_settings_page()
@@ -153,6 +163,21 @@ class MainWindow(QMainWindow):
         title_font.setWeight(QFont.Weight.DemiBold)
         title.setFont(title_font)
         layout.addWidget(title)
+        layout.addSpacing(16)
+
+        torrent_scanning_group = QGroupBox("Torrent Scanning")
+        torrent_scanning_group.setObjectName("torrentScanningGroup")
+        torrent_scanning_form = QFormLayout(torrent_scanning_group)
+        self.scan_torrent_metadata = QCheckBox()
+        self.scan_torrent_metadata.setObjectName("scanTorrentMetadata")
+        self.scan_torrent_metadata.setChecked(True)
+        self.scan_torrent_metadata.setAccessibleDescription(
+            "Read torrent metadata and update its JSON cache during library scans"
+        )
+        torrent_scanning_form.addRow(
+            "Scan and cache metadata", self.scan_torrent_metadata
+        )
+        layout.addWidget(torrent_scanning_group)
         layout.addSpacing(16)
 
         images_browser_group = QGroupBox("Images & Browser")
@@ -289,6 +314,9 @@ class MainWindow(QMainWindow):
         self.click_all_hidden_contents.setChecked(
             SETTINGS.value("click_all_hidden_contents", True, type=bool)
         )
+        self.scan_torrent_metadata.setChecked(
+            SETTINGS.value("scan_torrent_metadata", True, type=bool)
+        )
         self.tag_selectors.setPlainText(
             SETTINGS.value("tag_selectors", "#torrent_tags_list", type=str)
         )
@@ -334,6 +362,9 @@ class MainWindow(QMainWindow):
         SETTINGS.setValue(
             "click_all_hidden_contents", self.click_all_hidden_contents.isChecked()
         )
+        SETTINGS.setValue(
+            "scan_torrent_metadata", self.scan_torrent_metadata.isChecked()
+        )
         SETTINGS.setValue("tag_selectors", self.tag_selectors.toPlainText())
         SETTINGS.setValue(
             "tag_minimum_link_text_length",
@@ -350,6 +381,7 @@ class MainWindow(QMainWindow):
         SETTINGS.remove("torrent_images_maximum")
         SETTINGS.remove("tracker_page_timeout_seconds")
         SETTINGS.remove("click_all_hidden_contents")
+        SETTINGS.remove("scan_torrent_metadata")
         SETTINGS.remove("tag_selectors")
         SETTINGS.remove("tag_minimum_link_text_length")
         SETTINGS.remove("tag_name_excludes")
@@ -361,6 +393,7 @@ class MainWindow(QMainWindow):
         self.torrent_images_maximum.setValue(10)
         self.tracker_page_timeout.setValue(DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS)
         self.click_all_hidden_contents.setChecked(True)
+        self.scan_torrent_metadata.setChecked(True)
         self.tag_selectors.setPlainText("#torrent_tags_list")
         self.tag_minimum_link_text_length.setValue(3)
         self.tag_name_excludes.setPlainText("\\[-\\]\n\\[N\\]")
@@ -380,11 +413,35 @@ class MainWindow(QMainWindow):
             self._import_torrent_paths((Path(directory),))
 
     def open_torrent(self, path: Path) -> None:
-        metadata = parse_torrent(path)
-        self._show_metadata(metadata)
+        cache_error = ""
+        loaded_from_cache = False
+        try:
+            metadata = load_cached_metadata(DATA_DIR, path)
+        except MetadataCacheError as error:
+            cache_error = str(error)
+            metadata = None
+        if metadata is None:
+            try:
+                metadata = parse_torrent(path)
+            except Exception as error:
+                self.statusBar().showMessage(
+                    f"Could not open torrent metadata: {error}"
+                )
+                return
+            try:
+                save_cached_metadata(DATA_DIR, path, metadata)
+            except Exception as error:
+                cache_error = f"could not update metadata cache: {error}"
+        else:
+            loaded_from_cache = True
+        self._show_metadata(metadata, path)
+        if cache_error:
+            self.statusBar().showMessage(f"Loaded torrent metadata; {cache_error}")
+        elif loaded_from_cache:
+            self.statusBar().showMessage("Loaded cached torrent metadata")
 
-    def _show_metadata(self, metadata: TorrentMetadata) -> None:
-        results = self._build_results_page(metadata)
+    def _show_metadata(self, metadata: TorrentMetadata, source_path: Path) -> None:
+        results = self._build_results_page(metadata, source_path)
         self.stack.addWidget(results)
         self.stack.setCurrentWidget(results)
 
@@ -403,54 +460,72 @@ class MainWindow(QMainWindow):
             generation,
             self._torrent_directory(),
             DATA_DIR,
+            SETTINGS.value("scan_torrent_metadata", True, type=bool),
         )
         loader.moveToThread(thread)
         thread.started.connect(loader.load)
         loader.scan_started.connect(self._on_torrent_scan_started)
+        loader.item_started.connect(self._on_torrent_scan_item_started)
         loader.torrent_loaded.connect(self._on_torrent_loaded)
         loader.progress.connect(self._on_torrent_scan_progress)
         loader.finished.connect(self._on_torrent_scan_finished)
         loader.finished.connect(thread.quit)
         loader.finished.connect(loader.deleteLater)
-        thread.finished.connect(
-            lambda thread=thread: self._release_torrent_scan_thread(thread)
-        )
+        thread.finished.connect(self._release_torrent_scan_thread)
         thread.finished.connect(thread.deleteLater)
         self._torrent_scan_threads.add(thread)
         self._torrent_loaders[thread] = loader
         thread.start()
 
+    @Slot(int, int)
     def _on_torrent_scan_started(self, generation: int, total: int) -> None:
         if generation == self._torrent_scan_generation:
             self.torrents.set_loading_total(total)
 
+    @Slot(int, str)
+    def _on_torrent_scan_item_started(
+        self, generation: int, file_name: str
+    ) -> None:
+        if generation == self._torrent_scan_generation:
+            self.torrents.set_loading_item(file_name)
+
+    @Slot(int, object)
     def _on_torrent_loaded(
         self,
         generation: int,
-        path: Path,
-        display_name: str,
-        cached_image_total: int,
+        entry: TorrentLibraryEntry,
     ) -> None:
         if generation == self._torrent_scan_generation:
-            self.torrents.add_torrent(path, display_name, cached_image_total)
+            self.torrents.add_torrent(entry)
 
+    @Slot(int, int, int)
     def _on_torrent_scan_progress(
         self, generation: int, processed: int, total: int
     ) -> None:
         if generation == self._torrent_scan_generation:
             self.torrents.set_loading_progress(processed, total)
 
+    @Slot(int, int, int, str, bool)
     def _on_torrent_scan_finished(
         self,
         generation: int,
         unreadable_count: int,
+        cache_failure_count: int,
         error_message: str,
         canceled: bool,
     ) -> None:
         if generation == self._torrent_scan_generation and not canceled:
-            self.torrents.finish_loading(unreadable_count, error_message)
+            self.torrents.finish_loading(
+                unreadable_count,
+                cache_failure_count,
+                error_message,
+            )
 
-    def _release_torrent_scan_thread(self, thread: QThread) -> None:
+    @Slot()
+    def _release_torrent_scan_thread(self) -> None:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
         self._torrent_loaders.pop(thread, None)
         self._torrent_scan_threads.discard(thread)
 
@@ -574,15 +649,20 @@ class MainWindow(QMainWindow):
         self.drop_zone.set_downloading(True)
         self._show_torrent_url_status("Downloading torrent…")
         downloaded_path: Path | None = None
+        cache_error = ""
         try:
             torrent_directory = self._torrent_directory()
             torrent_directory.mkdir(parents=True, exist_ok=True)
             downloaded_path = download_torrent(url, torrent_directory)
             self._show_torrent_url_status("Download complete; loading torrent…")
             metadata = parse_torrent(downloaded_path)
-            self._store_downloaded_torrent(downloaded_path, metadata)
+            stored_path = self._store_downloaded_torrent(downloaded_path, metadata)
+            try:
+                save_cached_metadata(DATA_DIR, stored_path, metadata)
+            except Exception as error:
+                cache_error = str(error)
             self._start_torrent_scan()
-            self._show_metadata(metadata)
+            self._show_metadata(metadata, stored_path)
         except Exception as error:
             if downloaded_path is not None:
                 downloaded_path.unlink(missing_ok=True)
@@ -591,7 +671,10 @@ class MainWindow(QMainWindow):
             )
         else:
             self.drop_zone.url_input.clear()
-            self._show_torrent_url_status("Torrent downloaded and loaded")
+            message = "Torrent downloaded and loaded"
+            if cache_error:
+                message += f"; metadata cache not updated: {cache_error}"
+            self._show_torrent_url_status(message)
         finally:
             self.drop_zone.set_downloading(False)
 
@@ -602,6 +685,10 @@ class MainWindow(QMainWindow):
         for thread in tuple(self._torrent_scan_threads):
             thread.quit()
             thread.wait()
+        for thread in tuple(self._metadata_reload_threads):
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait()
         super().closeEvent(event)
 
     def _show_torrent_url_status(self, message: str) -> None:
@@ -609,7 +696,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         QApplication.processEvents()
 
-    def _build_results_page(self, metadata: TorrentMetadata) -> QWidget:
+    def _build_results_page(
+        self, metadata: TorrentMetadata, source_path: Path
+    ) -> QWidget:
         page, outer = self._page()
         back = QPushButton("Back")
         back.setObjectName("resultsBackButton")
@@ -673,6 +762,22 @@ class MainWindow(QMainWindow):
             table.verticalHeader().defaultSectionSize() * table.model().rowCount() + 2
         )
         details_layout.addWidget(table)
+        reload_metadata_button = QPushButton("Reload Metadata")
+        reload_metadata_button.setObjectName("reloadMetadataButton")
+        reload_metadata_button.setAccessibleDescription(
+            "Read metadata from the torrent file again and update its JSON cache"
+        )
+        reload_metadata_button.clicked.connect(
+            lambda: self._reload_metadata(
+                source_path,
+                page,
+                reload_metadata_button,
+            )
+        )
+        details_layout.addWidget(
+            reload_metadata_button,
+            alignment=Qt.AlignmentFlag.AlignRight,
+        )
         layout.addWidget(details_group)
         comment_group = QGroupBox("Comment")
         comment_layout = QVBoxLayout(comment_group)
@@ -716,6 +821,69 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
         outer.addWidget(splitter, stretch=1)
         return page
+
+    def _reload_metadata(
+        self,
+        source_path: Path,
+        results_page: QWidget,
+        reload_button: QPushButton,
+    ) -> None:
+        reload_button.setText("Reloading…")
+        reload_button.setEnabled(False)
+        self.statusBar().showMessage("Reloading torrent metadata…")
+        thread = QThread(self)
+        worker = MetadataReloadWorker(source_path, DATA_DIR)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.load)
+        worker.loaded.connect(self._metadata_reload_succeeded)
+        worker.failed.connect(self._metadata_reload_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._release_metadata_reload_thread)
+        thread.finished.connect(thread.deleteLater)
+        self._metadata_reload_threads.add(thread)
+        self._metadata_reload_workers[thread] = worker
+        self._metadata_reload_contexts[worker] = (
+            source_path,
+            results_page,
+            reload_button,
+        )
+        thread.start()
+
+    @Slot(object, object)
+    def _metadata_reload_succeeded(
+        self,
+        worker: MetadataReloadWorker,
+        metadata: TorrentMetadata,
+    ) -> None:
+        source_path, results_page, _ = self._metadata_reload_contexts[worker]
+        replacement = self._build_results_page(metadata, source_path)
+        was_current = self.stack.currentWidget() is results_page
+        self.stack.addWidget(replacement)
+        if was_current:
+            self.stack.setCurrentWidget(replacement)
+        self.stack.removeWidget(results_page)
+        results_page.deleteLater()
+        self.statusBar().showMessage("Metadata reloaded and cache updated")
+
+    @Slot(object, str)
+    def _metadata_reload_failed(
+        self, worker: MetadataReloadWorker, message: str
+    ) -> None:
+        _, _, reload_button = self._metadata_reload_contexts[worker]
+        reload_button.setText("Reload Metadata")
+        reload_button.setEnabled(True)
+        self.statusBar().showMessage(f"Could not reload metadata: {message}")
+
+    @Slot()
+    def _release_metadata_reload_thread(self) -> None:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
+        worker = self._metadata_reload_workers.pop(thread, None)
+        if worker is not None:
+            self._metadata_reload_contexts.pop(worker, None)
+        self._metadata_reload_threads.discard(thread)
 
     def _load_images(
         self,

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,3 +29,15 @@ class TorrentMetadata:
     files: tuple[TorrentFile, ...]
     piece_size: int
     total_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class TorrentLibraryEntry:
+    path: Path
+    display_name: str
+    torrent_hash: str
+    cached_image_count: int
+    metadata_cached: bool
+    total_size: int | None = None
+    file_count: int | None = None
+    tracker_count: int | None = None

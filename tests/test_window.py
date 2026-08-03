@@ -18,7 +18,14 @@ from PySide6.QtWidgets import (
 import torrentpal.torrent_loader
 import torrentpal.window
 from torrentpal.domain import Tag
-from torrentpal.widgets import ImageGallery, TagGrid
+from torrentpal.metadata_cache import load_cached_metadata, metadata_cache_path
+from torrentpal.widgets import (
+    ImageGallery,
+    TagGrid,
+    TorrentFileList,
+    TorrentFileListItem,
+    TorrentFileListItemWidget,
+)
 from torrentpal.window import MainWindow
 
 FIXTURE = Path(__file__).parent / "fixtures" / "known.torrent"
@@ -27,6 +34,10 @@ FIXTURE = Path(__file__).parent / "fixtures" / "known.torrent"
 @pytest.fixture(autouse=True)
 def isolate_torrent_data(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path / "app-data")
+    settings = QSettings(
+        str(tmp_path / "default-settings.ini"), QSettings.Format.IniFormat
+    )
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
 
 
 def write_torrent(path: Path, name: str) -> Path:
@@ -170,7 +181,7 @@ def test_home_downloads_torrent_url_and_opens_file(
     stored_paths = tuple((tmp_path / "torrents").glob("*.torrent"))
     assert len(stored_paths) == 1
     assert stored_paths[0].read_bytes() == FIXTURE.read_bytes()
-    assert window.torrents.table.topLevelItemCount() == 1
+    assert window.torrents.list.count() == 1
 
 
 def test_home_lists_torrents_and_click_loads_them(
@@ -188,16 +199,28 @@ def test_home_lists_torrents_and_click_loads_them(
     window = MainWindow()
     qtbot.addWidget(window)
     wait_for_torrent_scan(qtbot, window)
-    item = window.torrents.table.topLevelItem(0)
+    item = window.torrents.list.item(0)
+    item_widget = window.torrents.list.itemWidget(item)
 
     assert window.torrents.title() == "Torrents"
-    assert window.torrents.table.headerItem().text(1) == "Cached Images"
-    assert window.torrents.table.topLevelItemCount() == 1
-    assert item.text(0) == metadata.name
-    assert item.text(1) == "2"
-    assert item.toolTip(0) == str(saved_torrent)
+    assert isinstance(window.torrents.list, TorrentFileList)
+    assert isinstance(item, TorrentFileListItem)
+    assert isinstance(item_widget, TorrentFileListItemWidget)
+    assert window.torrents.list.count() == 1
+    assert item.entry.display_name == metadata.name
+    assert item.entry.cached_image_count == 2
+    assert item.toolTip() == str(saved_torrent)
+    assert item_widget.cached_images_label.text() == "2 cached images"
+    assert item_widget.metadata_cache_label.text() == "Metadata cached"
+    assert "1 file" in item_widget.details_label.text()
 
-    window.torrents.table.itemClicked.emit(item, 0)
+    window.show()
+    qtbot.waitExposed(window)
+    qtbot.mouseClick(
+        window.torrents.list.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=window.torrents.list.visualItemRect(item).center(),
+    )
 
     assert window.stack.currentWidget() is not window.input_page
     assert window.findChild(QTextBrowser, "commentBrowser") is not None
@@ -210,7 +233,7 @@ def test_home_refreshes_torrents_when_returning(
     window = MainWindow()
     qtbot.addWidget(window)
     wait_for_torrent_scan(qtbot, window)
-    assert window.torrents.table.topLevelItemCount() == 0
+    assert window.torrents.list.count() == 0
 
     torrent_directory = tmp_path / "torrents"
     torrent_directory.mkdir()
@@ -219,7 +242,7 @@ def test_home_refreshes_torrents_when_returning(
     window._show_input_page()
     wait_for_torrent_scan(qtbot, window)
 
-    assert window.torrents.table.topLevelItemCount() == 1
+    assert window.torrents.list.count() == 1
 
 
 def test_home_streams_torrents_from_worker_thread(
@@ -248,19 +271,100 @@ def test_home_streams_torrents_from_worker_thread(
     loader = next(iter(window._torrent_loaders.values()))
 
     assert loader.thread() is not window.thread()
+    assert window.torrents.list.thread() is window.thread()
     assert window.torrents.is_loading
     assert not window.torrents.progress_bar.isHidden()
     qtbot.waitUntil(
-        lambda: window.torrents.table.topLevelItemCount() >= 1,
+        lambda: window.torrents.list.count() >= 1,
         timeout=10_000,
     )
     assert window.torrents.is_loading
-    assert window.torrents.table.topLevelItemCount() < 3
+    assert window.torrents.list.count() < 3
+    assert "torrent-" in window.torrents.progress_bar.format()
 
     wait_for_torrent_scan(qtbot, window)
 
-    assert window.torrents.table.topLevelItemCount() == 3
+    assert window.torrents.list.count() == 3
     assert window.torrents.progress_bar.isHidden()
+
+
+def test_metadata_scan_setting_can_list_without_parsing(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("scan_torrent_metadata", False)
+    torrent_directory = tmp_path / "torrents"
+    torrent_directory.mkdir()
+    invalid_torrent = torrent_directory / "unparsed.torrent"
+    invalid_torrent.write_text("not bencoded torrent data", encoding="utf-8")
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    wait_for_torrent_scan(qtbot, window)
+    item = window.torrents.list.item(0)
+    item_widget = window.torrents.list.itemWidget(item)
+
+    assert window.torrents.list.count() == 1
+    assert item.entry.display_name == "unparsed.torrent"
+    assert item.entry.total_size is None
+    assert item_widget.details_label.text() == "Metadata scan disabled"
+    assert not metadata_cache_path(tmp_path, invalid_torrent).exists()
+
+
+def test_open_torrent_prefers_cached_metadata(qtbot, tmp_path, monkeypatch) -> None:
+    torrent_directory = tmp_path / "torrents"
+    torrent_directory.mkdir()
+    saved_torrent = torrent_directory / "saved.torrent"
+    saved_torrent.write_bytes(FIXTURE.read_bytes())
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    wait_for_torrent_scan(qtbot, window)
+    saved_torrent.write_text("now unreadable", encoding="utf-8")
+
+    window.open_torrent(saved_torrent)
+
+    assert window.stack.currentWidget() is not window.input_page
+    assert (
+        window.stack.currentWidget().findChild(QLabel, "torrentTitle").text()
+        == "known.bin"
+    )
+    assert window.statusBar().currentMessage() == "Loaded cached torrent metadata"
+
+
+def test_reload_metadata_updates_json_cache_in_worker_thread(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    torrent_directory = tmp_path / "torrents"
+    torrent_directory.mkdir()
+    saved_torrent = torrent_directory / "saved.torrent"
+    saved_torrent.write_bytes(FIXTURE.read_bytes())
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    wait_for_torrent_scan(qtbot, window)
+    window.open_torrent(saved_torrent)
+    write_torrent(saved_torrent, "updated.bin")
+    reload_button = window.stack.currentWidget().findChild(
+        QPushButton, "reloadMetadataButton"
+    )
+
+    qtbot.mouseClick(reload_button, Qt.MouseButton.LeftButton)
+    reload_worker = next(iter(window._metadata_reload_workers.values()))
+
+    assert reload_worker.thread() is not window.thread()
+    qtbot.waitUntil(
+        lambda: window.statusBar().currentMessage()
+        == "Metadata reloaded and cache updated",
+        timeout=10_000,
+    )
+    assert (
+        window.stack.currentWidget().findChild(QLabel, "torrentTitle").text()
+        == "updated.bin"
+    )
+    assert load_cached_metadata(tmp_path, saved_torrent).name == "updated.bin"
 
 
 def test_home_imports_multiple_selected_torrents_without_removing_sources(
@@ -287,7 +391,7 @@ def test_home_imports_multiple_selected_torrents_without_removing_sources(
     assert first.exists()
     assert second.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
-    assert window.torrents.table.topLevelItemCount() == 2
+    assert window.torrents.list.count() == 2
     assert window.drop_zone.import_status.text() == "Imported 2 torrents"
     assert window.statusBar().currentMessage() == "Imported 2 torrents"
 
@@ -320,7 +424,7 @@ def test_home_imports_folder_torrents_and_reports_invalid_files(
     assert second.exists()
     assert invalid.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
-    assert window.torrents.table.topLevelItemCount() == 2
+    assert window.torrents.list.count() == 2
     assert window.drop_zone.import_status.text().startswith(
         "Imported 2 torrents; 1 failed: invalid.torrent:"
     )
@@ -352,7 +456,7 @@ def test_home_drag_drop_imports_multiple_torrents(qtbot, tmp_path, monkeypatch) 
     assert first.exists()
     assert second.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
-    assert window.torrents.table.topLevelItemCount() == 2
+    assert window.torrents.list.count() == 2
     assert window.drop_zone.import_status.text() == "Imported 2 torrents"
 
 
@@ -374,7 +478,7 @@ def test_home_reimport_keeps_one_managed_torrent(qtbot, tmp_path, monkeypatch) -
     assert first.exists()
     assert second.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 1
-    assert window.torrents.table.topLevelItemCount() == 1
+    assert window.torrents.list.count() == 1
     assert window.drop_zone.import_status.text() == (
         "Imported 1 torrent; 1 torrent already in Torrents"
     )
@@ -572,6 +676,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.torrent_images_maximum.value() == 10
     assert window.tracker_page_timeout.value() == 120
     assert window.click_all_hidden_contents.isChecked()
+    assert window.scan_torrent_metadata.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
@@ -584,6 +689,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     window.torrent_images_maximum.setValue(6)
     window.tracker_page_timeout.setValue(240)
     window.click_all_hidden_contents.setChecked(False)
+    window.scan_torrent_metadata.setChecked(False)
     window.tag_selectors.setPlainText("#torrent_tags_list\n.tags")
     window.tag_minimum_link_text_length.setValue(4)
     window.tag_name_excludes.setPlainText("\\[-\\]\nignore")
@@ -595,6 +701,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert settings.value("torrent_images_maximum", type=int) == 6
     assert settings.value("tracker_page_timeout_seconds", type=int) == 240
     assert not settings.value("click_all_hidden_contents", type=bool)
+    assert not settings.value("scan_torrent_metadata", type=bool)
     assert settings.value("tag_selectors", type=str) == "#torrent_tags_list\n.tags"
     assert settings.value("tag_minimum_link_text_length", type=int) == 4
     assert settings.value("tag_name_excludes", type=str) == "\\[-\\]\nignore"
@@ -607,6 +714,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.torrent_images_maximum.value() == 6
     assert window.tracker_page_timeout.value() == 240
     assert not window.click_all_hidden_contents.isChecked()
+    assert not window.scan_torrent_metadata.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list\n.tags"
     assert window.tag_minimum_link_text_length.value() == 4
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\nignore"
@@ -617,11 +725,13 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.torrent_images_maximum.value() == 10
     assert window.tracker_page_timeout.value() == 120
     assert window.click_all_hidden_contents.isChecked()
+    assert window.scan_torrent_metadata.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
     assert not settings.contains("cookies_file")
     assert not settings.contains("tracker_page_timeout_seconds")
+    assert not settings.contains("scan_torrent_metadata")
     qtbot.mouseClick(window.cancel_settings_button, Qt.MouseButton.LeftButton)
     assert window.stack.currentWidget() is window.input_page
 
