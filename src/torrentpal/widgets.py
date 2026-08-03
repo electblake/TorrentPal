@@ -17,16 +17,18 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
+    QProgressBar,
     QPushButton,
     QStackedWidget,
     QTableView,
     QTextBrowser,
     QToolButton,
     QTreeView,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -42,15 +44,34 @@ class TorrentList(QGroupBox):
         self.setObjectName("torrentsGroup")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(4)
 
-        self.list = QListWidget()
-        self.list.setObjectName("torrentsList")
-        self.list.setAccessibleName("Torrents")
-        self.list.setAccessibleDescription("Select a torrent to open its metadata")
-        self.list.setAlternatingRowColors(True)
-        self.list.itemClicked.connect(self._open_item)
-        layout.addWidget(self.list)
+        self.table = QTreeWidget()
+        self.table.setObjectName("torrentsTable")
+        self.table.setAccessibleName("Torrents")
+        self.table.setAccessibleDescription("Select a torrent to open its metadata")
+        self.table.setColumnCount(2)
+        self.table.setHeaderLabels(("Torrent", "Cached Images"))
+        self.table.setRootIsDecorated(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setUniformRowHeights(True)
+        header = self.table.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.table.itemClicked.connect(self._open_item)
+        layout.addWidget(self.table)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("torrentLoadingProgress")
+        self.progress_bar.setAccessibleName("Torrent loading progress")
+        layout.addWidget(self.progress_bar)
+
+        self.load_status = QLabel()
+        self.load_status.setObjectName("torrentLoadingStatus")
+        self.load_status.setWordWrap(True)
+        self.load_status.hide()
+        layout.addWidget(self.load_status)
 
         self.empty_label = QLabel(
             "No torrents yet. Import files, a folder, or download from a URL."
@@ -58,21 +79,65 @@ class TorrentList(QGroupBox):
         self.empty_label.setObjectName("torrentsEmpty")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.empty_label)
-        self.set_torrents(())
+        self._is_loading = False
+        self.begin_loading()
 
-    def set_torrents(self, torrents: tuple[tuple[Path, str], ...]) -> None:
-        self.list.clear()
-        for path, display_name in torrents:
-            item = QListWidgetItem(display_name)
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            item.setToolTip(str(path))
-            self.list.addItem(item)
-        has_torrents = bool(torrents)
-        self.list.setVisible(has_torrents)
+    @property
+    def is_loading(self) -> bool:
+        return self._is_loading
+
+    def begin_loading(self) -> None:
+        self._is_loading = True
+        self.table.clear()
+        self.table.show()
+        self.empty_label.hide()
+        self.load_status.hide()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Finding torrents…")
+        self.progress_bar.show()
+
+    def set_loading_total(self, total: int) -> None:
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Loading torrents… %v / %m")
+
+    def add_torrent(
+        self, path: Path, display_name: str, cached_image_total: int
+    ) -> None:
+        item = QTreeWidgetItem([display_name, str(cached_image_total)])
+        item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+        item.setToolTip(0, str(path))
+        item.setToolTip(1, f"{cached_image_total} cached images")
+        item.setTextAlignment(
+            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.table.addTopLevelItem(item)
+
+    def set_loading_progress(self, processed: int, total: int) -> None:
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(processed)
+
+    def finish_loading(self, unreadable_count: int, error_message: str) -> None:
+        self._is_loading = False
+        self.progress_bar.hide()
+        self.table.resizeColumnToContents(1)
+        has_torrents = self.table.topLevelItemCount() > 0
+        self.table.setVisible(has_torrents)
         self.empty_label.setVisible(not has_torrents)
+        if error_message:
+            self.load_status.setText(f"Could not load torrents: {error_message}")
+        elif unreadable_count:
+            noun = "file" if unreadable_count == 1 else "files"
+            self.load_status.setText(
+                f"Skipped {unreadable_count} unreadable torrent {noun}."
+            )
+        else:
+            self.load_status.clear()
+        self.load_status.setVisible(bool(self.load_status.text()))
 
-    def _open_item(self, item: QListWidgetItem) -> None:
-        self.open_requested.emit(Path(item.data(Qt.ItemDataRole.UserRole)))
+    def _open_item(self, item: QTreeWidgetItem, column: int) -> None:
+        del column
+        self.open_requested.emit(Path(item.data(0, Qt.ItemDataRole.UserRole)))
 
 
 class TagGrid(QWidget):
@@ -303,13 +368,9 @@ class DropZone(QGroupBox):
         super().__init__("Import torrents")
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 32, 24, 32)
-        layout.setSpacing(12)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
         drop_text = QLabel("Drag .torrent files or a folder here")
-        drop_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        separator = QLabel("or choose what to import")
-        separator.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.browse_button = QPushButton("Open Files…")
         self.browse_button.setObjectName("openTorrentFilesButton")
         self.browse_button.setAccessibleDescription(
@@ -320,18 +381,11 @@ class DropZone(QGroupBox):
         self.folder_button.setAccessibleDescription(
             "Choose a folder containing .torrent files to import"
         )
-        import_actions = QHBoxLayout()
-        import_actions.addStretch()
-        import_actions.addWidget(self.browse_button)
-        import_actions.addWidget(self.folder_button)
-        import_actions.addStretch()
-        self.import_status = QLabel()
-        self.import_status.setObjectName("torrentImportStatus")
-        self.import_status.setAccessibleName("Torrent import status")
-        self.import_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.import_status.setWordWrap(True)
-        url_separator = QLabel("or download from a URL")
-        url_separator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        file_actions = QHBoxLayout()
+        file_actions.addWidget(drop_text)
+        file_actions.addStretch()
+        file_actions.addWidget(self.browse_button)
+        file_actions.addWidget(self.folder_button)
         self.url_input = QLineEdit()
         self.url_input.setObjectName("torrentUrlInput")
         self.url_input.setPlaceholderText("https://example.com/file.torrent?authkey=…")
@@ -353,23 +407,20 @@ class DropZone(QGroupBox):
         self.url_input.returnPressed.connect(self._request_url)
         self.download_button.clicked.connect(self._request_url)
         url_actions = QHBoxLayout()
-        url_actions.addStretch()
+        url_actions.addWidget(self.url_input, stretch=1)
         url_actions.addWidget(self.paste_button)
         url_actions.addWidget(self.download_button)
-        url_actions.addStretch()
-        self.url_status = QLabel()
-        self.url_status.setObjectName("torrentUrlStatus")
-        self.url_status.setAccessibleName("Torrent URL status")
-        self.url_status.setWordWrap(True)
+        self.status_label = QLabel()
+        self.status_label.setObjectName("torrentOperationStatus")
+        self.status_label.setAccessibleName("Torrent operation status")
+        self.status_label.setWordWrap(True)
+        self.status_label.hide()
+        self.import_status = self.status_label
+        self.url_status = self.status_label
         self._downloading = False
-        layout.addWidget(drop_text)
-        layout.addWidget(separator)
-        layout.addLayout(import_actions)
-        layout.addWidget(self.import_status)
-        layout.addWidget(url_separator)
-        layout.addWidget(self.url_input)
+        layout.addLayout(file_actions)
         layout.addLayout(url_actions)
-        layout.addWidget(self.url_status)
+        layout.addWidget(self.status_label)
 
     def _request_url(self) -> None:
         if self.download_button.isEnabled():
@@ -390,10 +441,14 @@ class DropZone(QGroupBox):
         self._update_download_button()
 
     def set_url_status(self, message: str) -> None:
-        self.url_status.setText(message)
+        self._set_status(message)
 
     def set_import_status(self, message: str) -> None:
-        self.import_status.setText(message)
+        self._set_status(message)
+
+    def _set_status(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.status_label.setVisible(bool(message))
 
     @staticmethod
     def _paths_from_mime_data(mime_data) -> tuple[Path, ...]:

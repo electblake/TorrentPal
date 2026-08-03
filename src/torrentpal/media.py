@@ -111,6 +111,14 @@ def cached_images(
     return tuple(sorted(paths, key=dimensions, reverse=True)[:maximum_images])
 
 
+def cached_image_count(data_dir: Path, torrent_hash: str) -> int:
+    return sum(
+        1
+        for path in data_dir.glob(f"{torrent_hash}_*x*_*")
+        if path.is_file() and re.search(r"_\d+x\d+_\d+$", path.name)
+    )
+
+
 def _browser_timeout_ms(timeout_seconds: int) -> int:
     if timeout_seconds <= 0:
         raise ValueError("Tracker page timeout must be greater than zero")

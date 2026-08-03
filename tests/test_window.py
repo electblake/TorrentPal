@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -14,12 +15,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import torrentpal.torrent_loader
 import torrentpal.window
 from torrentpal.domain import Tag
 from torrentpal.widgets import ImageGallery, TagGrid
 from torrentpal.window import MainWindow
 
 FIXTURE = Path(__file__).parent / "fixtures" / "known.torrent"
+
+
+@pytest.fixture(autouse=True)
+def isolate_torrent_data(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path / "app-data")
 
 
 def write_torrent(path: Path, name: str) -> Path:
@@ -30,6 +37,10 @@ def write_torrent(path: Path, name: str) -> Path:
     )
     path.write_bytes(contents)
     return path
+
+
+def wait_for_torrent_scan(qtbot, window: MainWindow) -> None:
+    qtbot.waitUntil(lambda: not window.torrents.is_loading, timeout=10_000)
 
 
 def test_window_opens_torrent(qtbot) -> None:
@@ -46,6 +57,35 @@ def test_window_opens_torrent(qtbot) -> None:
     assert window.findChild(QPushButton, "fetchTagsButton").text() == "Fetch Tags"
     assert window.findChild(QPushButton, "fetchImageButton").text() == "Fetch Image"
     assert window.statusBar().currentMessage() == "Ready"
+
+
+def test_home_uses_fluid_splitter_and_compact_import_group(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    splitter = window.findChild(QSplitter, "homeSplitter")
+
+    assert splitter.orientation() == Qt.Orientation.Vertical
+    assert splitter.widget(0) is window.drop_zone
+    assert splitter.widget(1) is window.torrents
+    assert window.drop_zone.minimumHeight() == 0
+    assert window.drop_zone.maximumHeight() == 16777215
+    assert window.torrents.minimumHeight() == 0
+    assert window.torrents.maximumHeight() == 16777215
+    assert window.drop_zone.layout().count() == 3
+    assert window.drop_zone.status_label.isHidden()
+    assert not any(
+        label.text().startswith("or") for label in window.drop_zone.findChildren(QLabel)
+    )
+
+    available_height = sum(splitter.sizes())
+    splitter.setSizes(
+        [available_height // 2, available_height - available_height // 2]
+    )
+    QApplication.processEvents()
+    top_height, bottom_height = splitter.sizes()
+    assert top_height / (top_height + bottom_height) == pytest.approx(0.5, abs=0.02)
 
 
 def test_results_use_resizable_image_and_details_split(
@@ -119,6 +159,7 @@ def test_home_downloads_torrent_url_and_opens_file(
 
     assert window.drop_zone.download_button.isEnabled()
     qtbot.mouseClick(window.drop_zone.download_button, Qt.MouseButton.LeftButton)
+    wait_for_torrent_scan(qtbot, window)
 
     assert window.stack.currentWidget() is not window.input_page
     assert window.statusBar().currentMessage() == "Torrent downloaded and loaded"
@@ -129,7 +170,7 @@ def test_home_downloads_torrent_url_and_opens_file(
     stored_paths = tuple((tmp_path / "torrents").glob("*.torrent"))
     assert len(stored_paths) == 1
     assert stored_paths[0].read_bytes() == FIXTURE.read_bytes()
-    assert window.torrents.list.count() == 1
+    assert window.torrents.table.topLevelItemCount() == 1
 
 
 def test_home_lists_torrents_and_click_loads_them(
@@ -140,17 +181,23 @@ def test_home_lists_torrents_and_click_loads_them(
     torrent_directory.mkdir()
     saved_torrent = torrent_directory / "saved.torrent"
     saved_torrent.write_bytes(FIXTURE.read_bytes())
+    metadata = torrentpal.window.parse_torrent(FIXTURE)
+    (tmp_path / f"{metadata.info_hash_v1}_20x20_0").write_bytes(b"image")
+    (tmp_path / f"{metadata.info_hash_v1}_30x30_1").write_bytes(b"image")
 
     window = MainWindow()
     qtbot.addWidget(window)
-    item = window.torrents.list.item(0)
+    wait_for_torrent_scan(qtbot, window)
+    item = window.torrents.table.topLevelItem(0)
 
     assert window.torrents.title() == "Torrents"
-    assert window.torrents.list.count() == 1
-    assert item.text() == torrentpal.window.parse_torrent(FIXTURE).name
-    assert item.toolTip() == str(saved_torrent)
+    assert window.torrents.table.headerItem().text(1) == "Cached Images"
+    assert window.torrents.table.topLevelItemCount() == 1
+    assert item.text(0) == metadata.name
+    assert item.text(1) == "2"
+    assert item.toolTip(0) == str(saved_torrent)
 
-    window.torrents.list.itemClicked.emit(item)
+    window.torrents.table.itemClicked.emit(item, 0)
 
     assert window.stack.currentWidget() is not window.input_page
     assert window.findChild(QTextBrowser, "commentBrowser") is not None
@@ -162,15 +209,58 @@ def test_home_refreshes_torrents_when_returning(
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
     window = MainWindow()
     qtbot.addWidget(window)
-    assert window.torrents.list.count() == 0
+    wait_for_torrent_scan(qtbot, window)
+    assert window.torrents.table.topLevelItemCount() == 0
 
     torrent_directory = tmp_path / "torrents"
     torrent_directory.mkdir()
     (torrent_directory / "new.torrent").write_bytes(FIXTURE.read_bytes())
 
     window._show_input_page()
+    wait_for_torrent_scan(qtbot, window)
 
-    assert window.torrents.list.count() == 1
+    assert window.torrents.table.topLevelItemCount() == 1
+
+
+def test_home_streams_torrents_from_worker_thread(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    torrent_directory = tmp_path / "torrents"
+    torrent_directory.mkdir()
+    for index in range(3):
+        write_torrent(
+            torrent_directory / f"torrent-{index}.torrent",
+            f"torrent-{index}.bin",
+        )
+    original_parse_torrent = torrentpal.torrent_loader.parse_torrent
+
+    def slow_parse_torrent(path):
+        time.sleep(0.08)
+        return original_parse_torrent(path)
+
+    monkeypatch.setattr(
+        torrentpal.torrent_loader, "parse_torrent", slow_parse_torrent
+    )
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    loader = next(iter(window._torrent_loaders.values()))
+
+    assert loader.thread() is not window.thread()
+    assert window.torrents.is_loading
+    assert not window.torrents.progress_bar.isHidden()
+    qtbot.waitUntil(
+        lambda: window.torrents.table.topLevelItemCount() >= 1,
+        timeout=10_000,
+    )
+    assert window.torrents.is_loading
+    assert window.torrents.table.topLevelItemCount() < 3
+
+    wait_for_torrent_scan(qtbot, window)
+
+    assert window.torrents.table.topLevelItemCount() == 3
+    assert window.torrents.progress_bar.isHidden()
 
 
 def test_home_imports_multiple_selected_torrents_without_removing_sources(
@@ -191,12 +281,13 @@ def test_home_imports_multiple_selected_torrents_without_removing_sources(
     qtbot.addWidget(window)
 
     qtbot.mouseClick(window.drop_zone.browse_button, Qt.MouseButton.LeftButton)
+    wait_for_torrent_scan(qtbot, window)
 
     assert window.stack.currentWidget() is window.input_page
     assert first.exists()
     assert second.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
-    assert window.torrents.list.count() == 2
+    assert window.torrents.table.topLevelItemCount() == 2
     assert window.drop_zone.import_status.text() == "Imported 2 torrents"
     assert window.statusBar().currentMessage() == "Imported 2 torrents"
 
@@ -222,13 +313,14 @@ def test_home_imports_folder_torrents_and_reports_invalid_files(
     qtbot.addWidget(window)
 
     qtbot.mouseClick(window.drop_zone.folder_button, Qt.MouseButton.LeftButton)
+    wait_for_torrent_scan(qtbot, window)
 
     assert window.stack.currentWidget() is window.input_page
     assert first.exists()
     assert second.exists()
     assert invalid.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
-    assert window.torrents.list.count() == 2
+    assert window.torrents.table.topLevelItemCount() == 2
     assert window.drop_zone.import_status.text().startswith(
         "Imported 2 torrents; 1 failed: invalid.torrent:"
     )
@@ -254,12 +346,13 @@ def test_home_drag_drop_imports_multiple_torrents(qtbot, tmp_path, monkeypatch) 
     )
 
     window.drop_zone.dropEvent(event)
+    wait_for_torrent_scan(qtbot, window)
 
     assert event.isAccepted()
     assert first.exists()
     assert second.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
-    assert window.torrents.list.count() == 2
+    assert window.torrents.table.topLevelItemCount() == 2
     assert window.drop_zone.import_status.text() == "Imported 2 torrents"
 
 
@@ -276,11 +369,12 @@ def test_home_reimport_keeps_one_managed_torrent(qtbot, tmp_path, monkeypatch) -
     qtbot.addWidget(window)
 
     window._import_torrent_paths((first, second))
+    wait_for_torrent_scan(qtbot, window)
 
     assert first.exists()
     assert second.exists()
     assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 1
-    assert window.torrents.list.count() == 1
+    assert window.torrents.table.topLevelItemCount() == 1
     assert window.drop_zone.import_status.text() == (
         "Imported 1 torrent; 1 torrent already in Torrents"
     )

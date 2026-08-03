@@ -1,8 +1,8 @@
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QShowEvent
+from PySide6.QtCore import Qt, QThread
+from PySide6.QtGui import QCloseEvent, QFont, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -47,6 +47,7 @@ from torrentpal.media import (
 )
 from torrentpal.models import FileTreeModel, MetadataTableModel, TrackerModel
 from torrentpal.parser import parse_torrent
+from torrentpal.torrent_loader import TorrentLoader
 from torrentpal.widgets import (
     CollapsiblePanel,
     DropZone,
@@ -87,6 +88,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
+        self._torrent_scan_generation = 0
+        self._torrent_scan_threads: set[QThread] = set()
+        self._torrent_loaders: dict[QThread, TorrentLoader] = {}
         self.input_page = self._build_input_page()
         self.stack.addWidget(self.input_page)
         self.settings_page = self._build_settings_page()
@@ -120,16 +124,20 @@ class MainWindow(QMainWindow):
         self.drop_zone.paths_selected.connect(self._import_torrent_paths)
         self.drop_zone.paste_requested.connect(self._paste_torrent_url)
         self.drop_zone.url_requested.connect(self._download_and_open_torrent)
-        layout.addWidget(self.drop_zone)
-        layout.addSpacing(16)
         self.torrents = TorrentList()
         self.torrents.open_requested.connect(self.open_torrent)
-        layout.addWidget(self.torrents, stretch=1)
-        self._refresh_torrents()
-        layout.addSpacing(16)
+        self.home_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.home_splitter.setObjectName("homeSplitter")
+        self.home_splitter.addWidget(self.drop_zone)
+        self.home_splitter.addWidget(self.torrents)
+        self.home_splitter.setStretchFactor(0, 1)
+        self.home_splitter.setStretchFactor(1, 3)
+        layout.addWidget(self.home_splitter, stretch=1)
+        layout.addSpacing(8)
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self._open_settings)
         layout.addWidget(settings_button, alignment=Qt.AlignmentFlag.AlignRight)
+        self._start_torrent_scan()
         return page
 
     def _build_settings_page(self) -> QWidget:
@@ -383,31 +391,72 @@ class MainWindow(QMainWindow):
     def _torrent_directory(self) -> Path:
         return DATA_DIR / "torrents"
 
-    def _refresh_torrents(self) -> None:
-        torrent_directory = self._torrent_directory()
-        entries: list[tuple[Path, str]] = []
-        torrent_hashes: set[str] = set()
-        if torrent_directory.exists():
-            paths = sorted(
-                torrent_directory.glob("*.torrent"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            for path in paths:
-                try:
-                    metadata = parse_torrent(path)
-                except Exception:
-                    continue
-                torrent_hash = metadata.info_hash_v1 or metadata.info_hash_v2
-                if torrent_hash in torrent_hashes:
-                    continue
-                torrent_hashes.add(torrent_hash)
-                entries.append((path, metadata.name))
-        self.torrents.set_torrents(tuple(entries))
+    def _start_torrent_scan(self) -> None:
+        self._torrent_scan_generation += 1
+        generation = self._torrent_scan_generation
+        for active_thread in tuple(self._torrent_scan_threads):
+            active_thread.requestInterruption()
+
+        self.torrents.begin_loading()
+        thread = QThread(self)
+        loader = TorrentLoader(
+            generation,
+            self._torrent_directory(),
+            DATA_DIR,
+        )
+        loader.moveToThread(thread)
+        thread.started.connect(loader.load)
+        loader.scan_started.connect(self._on_torrent_scan_started)
+        loader.torrent_loaded.connect(self._on_torrent_loaded)
+        loader.progress.connect(self._on_torrent_scan_progress)
+        loader.finished.connect(self._on_torrent_scan_finished)
+        loader.finished.connect(thread.quit)
+        loader.finished.connect(loader.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread: self._release_torrent_scan_thread(thread)
+        )
+        thread.finished.connect(thread.deleteLater)
+        self._torrent_scan_threads.add(thread)
+        self._torrent_loaders[thread] = loader
+        thread.start()
+
+    def _on_torrent_scan_started(self, generation: int, total: int) -> None:
+        if generation == self._torrent_scan_generation:
+            self.torrents.set_loading_total(total)
+
+    def _on_torrent_loaded(
+        self,
+        generation: int,
+        path: Path,
+        display_name: str,
+        cached_image_total: int,
+    ) -> None:
+        if generation == self._torrent_scan_generation:
+            self.torrents.add_torrent(path, display_name, cached_image_total)
+
+    def _on_torrent_scan_progress(
+        self, generation: int, processed: int, total: int
+    ) -> None:
+        if generation == self._torrent_scan_generation:
+            self.torrents.set_loading_progress(processed, total)
+
+    def _on_torrent_scan_finished(
+        self,
+        generation: int,
+        unreadable_count: int,
+        error_message: str,
+        canceled: bool,
+    ) -> None:
+        if generation == self._torrent_scan_generation and not canceled:
+            self.torrents.finish_loading(unreadable_count, error_message)
+
+    def _release_torrent_scan_thread(self, thread: QThread) -> None:
+        self._torrent_loaders.pop(thread, None)
+        self._torrent_scan_threads.discard(thread)
 
     def _show_input_page(self) -> None:
-        self._refresh_torrents()
         self.stack.setCurrentWidget(self.input_page)
+        self._start_torrent_scan()
 
     def _import_torrent_paths(self, selected_paths: tuple[Path, ...]) -> None:
         torrent_paths: list[Path] = []
@@ -478,7 +527,7 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 failures.append(f"{torrent_path.name}: {error}")
 
-        self._refresh_torrents()
+        self._start_torrent_scan()
         status_parts = []
         if imported_count:
             noun = "torrent" if imported_count == 1 else "torrents"
@@ -532,7 +581,7 @@ class MainWindow(QMainWindow):
             self._show_torrent_url_status("Download complete; loading torrent…")
             metadata = parse_torrent(downloaded_path)
             self._store_downloaded_torrent(downloaded_path, metadata)
-            self._refresh_torrents()
+            self._start_torrent_scan()
             self._show_metadata(metadata)
         except Exception as error:
             if downloaded_path is not None:
@@ -545,6 +594,15 @@ class MainWindow(QMainWindow):
             self._show_torrent_url_status("Torrent downloaded and loaded")
         finally:
             self.drop_zone.set_downloading(False)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._torrent_scan_generation += 1
+        for thread in tuple(self._torrent_scan_threads):
+            thread.requestInterruption()
+        for thread in tuple(self._torrent_scan_threads):
+            thread.quit()
+            thread.wait()
+        super().closeEvent(event)
 
     def _show_torrent_url_status(self, message: str) -> None:
         self.drop_zone.set_url_status(message)
