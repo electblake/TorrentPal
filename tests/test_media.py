@@ -117,6 +117,7 @@ def test_download_images_clicks_show_links_before_indexing(tmp_path) -> None:
         180,
         10,
         True,
+        5,
         statuses.append,
     )
 
@@ -127,3 +128,110 @@ def test_download_images_clicks_show_links_before_indexing(tmp_path) -> None:
     ]
     assert "Revealing hidden content" in statuses
     assert "Revealed 2 hidden content sections" in statuses
+
+
+def test_download_images_filters_native_not_rendered_dimensions(tmp_path) -> None:
+    large = tmp_path / "large.svg"
+    large.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"></svg>',
+        encoding="utf-8",
+    )
+    small = tmp_path / "small.svg"
+    small.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"></svg>',
+        encoding="utf-8",
+    )
+    page = tmp_path / "native-size.html"
+    page.write_text(
+        """<img src="large.svg" style="width: 10px; height: 10px">
+        <img src="small.svg" style="width: 1000px; height: 1000px">""",
+        encoding="utf-8",
+    )
+    cookies = tmp_path / "cookies.json"
+    cookies.write_text(json.dumps([]), encoding="utf-8")
+
+    images = download_images(
+        page.as_uri(),
+        cookies,
+        tmp_path,
+        "native",
+        320,
+        180,
+        10,
+        False,
+        5,
+        lambda message: None,
+    )
+
+    assert [image.name for image in images] == ["native_640x480_0"]
+
+
+def test_download_images_waits_for_delayed_images(tmp_path) -> None:
+    image = tmp_path / "delayed.svg"
+    image.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"></svg>',
+        encoding="utf-8",
+    )
+    page = tmp_path / "delayed.html"
+    page.write_text(
+        """<script>
+        setTimeout(() => {
+            const image = document.createElement('img');
+            image.src = 'delayed.svg';
+            document.body.appendChild(image);
+        }, 100);
+        </script>""",
+        encoding="utf-8",
+    )
+    cookies = tmp_path / "cookies.json"
+    cookies.write_text(json.dumps([]), encoding="utf-8")
+
+    images = download_images(
+        page.as_uri(),
+        cookies,
+        tmp_path,
+        "delayed",
+        320,
+        180,
+        10,
+        False,
+        5,
+        lambda message: None,
+    )
+
+    assert [image.name for image in images] == ["delayed_640x480_0"]
+
+
+def test_download_images_reports_zero_native_matches_without_clearing_cache(
+    tmp_path,
+) -> None:
+    small = tmp_path / "small.svg"
+    small.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"></svg>',
+        encoding="utf-8",
+    )
+    page = tmp_path / "small.html"
+    page.write_text(
+        '<img src="small.svg" style="width: 1000px; height: 1000px">',
+        encoding="utf-8",
+    )
+    cookies = tmp_path / "cookies.json"
+    cookies.write_text(json.dumps([]), encoding="utf-8")
+    cached = tmp_path / "zero_800x600_0"
+    cached.write_bytes(b"existing image")
+
+    with pytest.raises(RuntimeError, match="native minimum 320x180"):
+        download_images(
+            page.as_uri(),
+            cookies,
+            tmp_path,
+            "zero",
+            320,
+            180,
+            10,
+            False,
+            1,
+            lambda message: None,
+        )
+
+    assert cached.read_bytes() == b"existing image"

@@ -34,26 +34,28 @@ from PySide6.QtWidgets import (
 from torrentpal.domain import Tag
 
 
-class DownloadedTorrentList(QGroupBox):
+class TorrentList(QGroupBox):
     open_requested = Signal(Path)
 
     def __init__(self) -> None:
-        super().__init__("Previously downloaded torrents")
-        self.setObjectName("downloadedTorrentsGroup")
+        super().__init__("Torrents")
+        self.setObjectName("torrentsGroup")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
         self.list = QListWidget()
-        self.list.setObjectName("downloadedTorrentsList")
-        self.list.setAccessibleName("Previously downloaded torrents")
-        self.list.setAccessibleDescription("Click a torrent to load it")
+        self.list.setObjectName("torrentsList")
+        self.list.setAccessibleName("Torrents")
+        self.list.setAccessibleDescription("Select a torrent to open its metadata")
         self.list.setAlternatingRowColors(True)
         self.list.itemClicked.connect(self._open_item)
         layout.addWidget(self.list)
 
-        self.empty_label = QLabel("No downloaded torrents yet.")
-        self.empty_label.setObjectName("downloadedTorrentsEmpty")
+        self.empty_label = QLabel(
+            "No torrents yet. Import files, a folder, or download from a URL."
+        )
+        self.empty_label.setObjectName("torrentsEmpty")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.empty_label)
         self.set_torrents(())
@@ -293,23 +295,41 @@ class ImageGallery(QWidget):
 
 
 class DropZone(QGroupBox):
-    file_selected = Signal(Path)
+    paths_selected = Signal(tuple)
     paste_requested = Signal()
     url_requested = Signal(str)
 
     def __init__(self) -> None:
-        super().__init__("Open torrent file")
+        super().__init__("Import torrents")
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 32, 24, 32)
         layout.setSpacing(12)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        drop_text = QLabel("Drag a .torrent file here")
+        drop_text = QLabel("Drag .torrent files or a folder here")
         drop_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        separator = QLabel("or")
+        separator = QLabel("or choose what to import")
         separator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.browse_button = QPushButton("Browse…")
-        self.browse_button.setAccessibleDescription("Choose a local .torrent file")
+        self.browse_button = QPushButton("Open Files…")
+        self.browse_button.setObjectName("openTorrentFilesButton")
+        self.browse_button.setAccessibleDescription(
+            "Choose one or more local .torrent files to import"
+        )
+        self.folder_button = QPushButton("Open Folder…")
+        self.folder_button.setObjectName("openTorrentFolderButton")
+        self.folder_button.setAccessibleDescription(
+            "Choose a folder containing .torrent files to import"
+        )
+        import_actions = QHBoxLayout()
+        import_actions.addStretch()
+        import_actions.addWidget(self.browse_button)
+        import_actions.addWidget(self.folder_button)
+        import_actions.addStretch()
+        self.import_status = QLabel()
+        self.import_status.setObjectName("torrentImportStatus")
+        self.import_status.setAccessibleName("Torrent import status")
+        self.import_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.import_status.setWordWrap(True)
         url_separator = QLabel("or download from a URL")
         url_separator.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.url_input = QLineEdit()
@@ -344,7 +364,8 @@ class DropZone(QGroupBox):
         self._downloading = False
         layout.addWidget(drop_text)
         layout.addWidget(separator)
-        layout.addWidget(self.browse_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addLayout(import_actions)
+        layout.addWidget(self.import_status)
         layout.addWidget(url_separator)
         layout.addWidget(self.url_input)
         layout.addLayout(url_actions)
@@ -371,17 +392,40 @@ class DropZone(QGroupBox):
     def set_url_status(self, message: str) -> None:
         self.url_status.setText(message)
 
+    def set_import_status(self, message: str) -> None:
+        self.import_status.setText(message)
+
+    @staticmethod
+    def _paths_from_mime_data(mime_data) -> tuple[Path, ...]:
+        paths = tuple(
+            Path(url.toLocalFile())
+            for url in mime_data.urls()
+            if url.isLocalFile() and url.toLocalFile()
+        )
+        return tuple(
+            path
+            for path in paths
+            if path.is_dir() or path.suffix.lower() == ".torrent"
+        )
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        self.setTitle("Drop torrent file")
-        event.acceptProposedAction()
+        if self._paths_from_mime_data(event.mimeData()):
+            self.setTitle("Drop torrents to import")
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
-        self.setTitle("Open torrent file")
+        self.setTitle("Import torrents")
 
     def dropEvent(self, event: QDropEvent) -> None:
-        self.setTitle("Open torrent file")
-        self.file_selected.emit(Path(event.mimeData().urls()[0].toLocalFile()))
-        event.acceptProposedAction()
+        self.setTitle("Import torrents")
+        paths = self._paths_from_mime_data(event.mimeData())
+        if paths:
+            self.paths_selected.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 
 class CollapsiblePanel(QWidget):

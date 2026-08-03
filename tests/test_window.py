@@ -2,8 +2,8 @@ import json
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QMovie, QPixmap
+from PySide6.QtCore import QMimeData, QPointF, QSettings, Qt, QUrl
+from PySide6.QtGui import QDropEvent, QMovie, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGroupBox,
@@ -20,6 +20,16 @@ from torrentpal.widgets import ImageGallery, TagGrid
 from torrentpal.window import MainWindow
 
 FIXTURE = Path(__file__).parent / "fixtures" / "known.torrent"
+
+
+def write_torrent(path: Path, name: str) -> Path:
+    encoded_name = name.encode()
+    contents = FIXTURE.read_bytes().replace(
+        b"4:name9:known.bin",
+        b"4:name" + str(len(encoded_name)).encode() + b":" + encoded_name,
+    )
+    path.write_bytes(contents)
+    return path
 
 
 def test_window_opens_torrent(qtbot) -> None:
@@ -119,10 +129,10 @@ def test_home_downloads_torrent_url_and_opens_file(
     stored_paths = tuple((tmp_path / "torrents").glob("*.torrent"))
     assert len(stored_paths) == 1
     assert stored_paths[0].read_bytes() == FIXTURE.read_bytes()
-    assert window.downloaded_torrents.list.count() == 1
+    assert window.torrents.list.count() == 1
 
 
-def test_home_lists_saved_torrents_and_click_loads_them(
+def test_home_lists_torrents_and_click_loads_them(
     qtbot, tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
@@ -133,25 +143,26 @@ def test_home_lists_saved_torrents_and_click_loads_them(
 
     window = MainWindow()
     qtbot.addWidget(window)
-    item = window.downloaded_torrents.list.item(0)
+    item = window.torrents.list.item(0)
 
-    assert window.downloaded_torrents.list.count() == 1
+    assert window.torrents.title() == "Torrents"
+    assert window.torrents.list.count() == 1
     assert item.text() == torrentpal.window.parse_torrent(FIXTURE).name
     assert item.toolTip() == str(saved_torrent)
 
-    window.downloaded_torrents.list.itemClicked.emit(item)
+    window.torrents.list.itemClicked.emit(item)
 
     assert window.stack.currentWidget() is not window.input_page
     assert window.findChild(QTextBrowser, "commentBrowser") is not None
 
 
-def test_home_refreshes_downloaded_torrents_when_returning(
+def test_home_refreshes_torrents_when_returning(
     qtbot, tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr(torrentpal.window, "DATA_DIR", tmp_path)
     window = MainWindow()
     qtbot.addWidget(window)
-    assert window.downloaded_torrents.list.count() == 0
+    assert window.torrents.list.count() == 0
 
     torrent_directory = tmp_path / "torrents"
     torrent_directory.mkdir()
@@ -159,7 +170,120 @@ def test_home_refreshes_downloaded_torrents_when_returning(
 
     window._show_input_page()
 
-    assert window.downloaded_torrents.list.count() == 1
+    assert window.torrents.list.count() == 1
+
+
+def test_home_imports_multiple_selected_torrents_without_removing_sources(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    data_directory = tmp_path / "app-data"
+    source_directory = tmp_path / "selected"
+    source_directory.mkdir()
+    first = write_torrent(source_directory / "first.torrent", "first.bin")
+    second = write_torrent(source_directory / "second.torrent", "second.bin")
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", data_directory)
+    monkeypatch.setattr(
+        torrentpal.window.QFileDialog,
+        "getOpenFileNames",
+        lambda *arguments: ([str(first), str(second)], "Torrent files (*.torrent)"),
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    qtbot.mouseClick(window.drop_zone.browse_button, Qt.MouseButton.LeftButton)
+
+    assert window.stack.currentWidget() is window.input_page
+    assert first.exists()
+    assert second.exists()
+    assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
+    assert window.torrents.list.count() == 2
+    assert window.drop_zone.import_status.text() == "Imported 2 torrents"
+    assert window.statusBar().currentMessage() == "Imported 2 torrents"
+
+
+def test_home_imports_folder_torrents_and_reports_invalid_files(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    data_directory = tmp_path / "app-data"
+    source_directory = tmp_path / "folder"
+    source_directory.mkdir()
+    first = write_torrent(source_directory / "first.torrent", "first.bin")
+    second = write_torrent(source_directory / "second.TORRENT", "second.bin")
+    invalid = source_directory / "invalid.torrent"
+    invalid.write_text("not a torrent", encoding="utf-8")
+    (source_directory / "notes.txt").write_text("ignore me", encoding="utf-8")
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", data_directory)
+    monkeypatch.setattr(
+        torrentpal.window.QFileDialog,
+        "getExistingDirectory",
+        lambda *arguments: str(source_directory),
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    qtbot.mouseClick(window.drop_zone.folder_button, Qt.MouseButton.LeftButton)
+
+    assert window.stack.currentWidget() is window.input_page
+    assert first.exists()
+    assert second.exists()
+    assert invalid.exists()
+    assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
+    assert window.torrents.list.count() == 2
+    assert window.drop_zone.import_status.text().startswith(
+        "Imported 2 torrents; 1 failed: invalid.torrent:"
+    )
+
+
+def test_home_drag_drop_imports_multiple_torrents(qtbot, tmp_path, monkeypatch) -> None:
+    data_directory = tmp_path / "app-data"
+    source_directory = tmp_path / "dropped"
+    source_directory.mkdir()
+    first = write_torrent(source_directory / "first.torrent", "first.bin")
+    second = write_torrent(source_directory / "second.torrent", "second.bin")
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", data_directory)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    mime_data = QMimeData()
+    mime_data.setUrls([QUrl.fromLocalFile(first), QUrl.fromLocalFile(second)])
+    event = QDropEvent(
+        QPointF(10, 10),
+        Qt.DropAction.CopyAction,
+        mime_data,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+    window.drop_zone.dropEvent(event)
+
+    assert event.isAccepted()
+    assert first.exists()
+    assert second.exists()
+    assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 2
+    assert window.torrents.list.count() == 2
+    assert window.drop_zone.import_status.text() == "Imported 2 torrents"
+
+
+def test_home_reimport_keeps_one_managed_torrent(qtbot, tmp_path, monkeypatch) -> None:
+    data_directory = tmp_path / "app-data"
+    source_directory = tmp_path / "duplicates"
+    source_directory.mkdir()
+    first = source_directory / "first.torrent"
+    second = source_directory / "second.torrent"
+    first.write_bytes(FIXTURE.read_bytes())
+    second.write_bytes(FIXTURE.read_bytes())
+    monkeypatch.setattr(torrentpal.window, "DATA_DIR", data_directory)
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    window._import_torrent_paths((first, second))
+
+    assert first.exists()
+    assert second.exists()
+    assert len(tuple((data_directory / "torrents").glob("*.torrent"))) == 1
+    assert window.torrents.list.count() == 1
+    assert window.drop_zone.import_status.text() == (
+        "Imported 1 torrent; 1 torrent already in Torrents"
+    )
 
 
 def test_home_reports_torrent_url_download_error(qtbot, monkeypatch) -> None:
@@ -265,7 +389,9 @@ def test_window_cycles_cached_images_largest_first(
     assert gallery.pages.currentIndex() == 0
 
 
-def test_image_fetch_updates_button_and_status(qtbot, monkeypatch) -> None:
+def test_image_fetch_rejects_empty_results(qtbot, tmp_path, monkeypatch) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
     window = MainWindow()
     qtbot.addWidget(window)
     window.open_torrent(FIXTURE)
@@ -273,6 +399,7 @@ def test_image_fetch_updates_button_and_status(qtbot, monkeypatch) -> None:
 
     def fetch_images(*arguments):
         report_status = arguments[-1]
+        assert arguments[-2] == 120
         assert gallery.load_button.text() == "Fetching.."
         assert not gallery.load_button.isEnabled()
         report_status("Selecting qualifying images")
@@ -283,7 +410,9 @@ def test_image_fetch_updates_button_and_status(qtbot, monkeypatch) -> None:
 
     assert gallery.load_button.text() == "Fetch Image"
     assert gallery.load_button.isEnabled()
-    assert window.statusBar().currentMessage() == "Fetched and cached 0 images"
+    assert window.statusBar().currentMessage() == (
+        "Image fetch failed: No qualifying images were returned"
+    )
 
 
 def test_image_fetch_reports_errors(qtbot, monkeypatch) -> None:
@@ -347,6 +476,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 10
     assert window.image_minimum_height.value() == 10
     assert window.torrent_images_maximum.value() == 10
+    assert window.tracker_page_timeout.value() == 120
     assert window.click_all_hidden_contents.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
@@ -358,6 +488,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     window.image_minimum_width.setValue(320)
     window.image_minimum_height.setValue(180)
     window.torrent_images_maximum.setValue(6)
+    window.tracker_page_timeout.setValue(240)
     window.click_all_hidden_contents.setChecked(False)
     window.tag_selectors.setPlainText("#torrent_tags_list\n.tags")
     window.tag_minimum_link_text_length.setValue(4)
@@ -368,6 +499,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert settings.value("image_minimum_width", type=int) == 320
     assert settings.value("image_minimum_height", type=int) == 180
     assert settings.value("torrent_images_maximum", type=int) == 6
+    assert settings.value("tracker_page_timeout_seconds", type=int) == 240
     assert not settings.value("click_all_hidden_contents", type=bool)
     assert settings.value("tag_selectors", type=str) == "#torrent_tags_list\n.tags"
     assert settings.value("tag_minimum_link_text_length", type=int) == 4
@@ -379,6 +511,7 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 320
     assert window.image_minimum_height.value() == 180
     assert window.torrent_images_maximum.value() == 6
+    assert window.tracker_page_timeout.value() == 240
     assert not window.click_all_hidden_contents.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list\n.tags"
     assert window.tag_minimum_link_text_length.value() == 4
@@ -388,22 +521,27 @@ def test_settings_routes_and_persists(qtbot, tmp_path, monkeypatch) -> None:
     assert window.image_minimum_width.value() == 10
     assert window.image_minimum_height.value() == 10
     assert window.torrent_images_maximum.value() == 10
+    assert window.tracker_page_timeout.value() == 120
     assert window.click_all_hidden_contents.isChecked()
     assert window.tag_selectors.toPlainText() == "#torrent_tags_list"
     assert window.tag_minimum_link_text_length.value() == 3
     assert window.tag_name_excludes.toPlainText() == "\\[-\\]\n\\[N\\]"
     assert not settings.contains("cookies_file")
+    assert not settings.contains("tracker_page_timeout_seconds")
     qtbot.mouseClick(window.cancel_settings_button, Qt.MouseButton.LeftButton)
     assert window.stack.currentWidget() is window.input_page
 
 
-def test_tag_fetch_populates_grid_and_status(qtbot, monkeypatch) -> None:
+def test_tag_fetch_populates_grid_and_status(qtbot, tmp_path, monkeypatch) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(torrentpal.window, "SETTINGS", settings)
     window = MainWindow()
     qtbot.addWidget(window)
     window.open_torrent(FIXTURE)
     grid = window.findChild(TagGrid, "tagGrid")
 
     def fetch_tags(*arguments):
+        assert arguments[-2] == 120
         assert grid.load_button.text() == "Fetching.."
         assert not grid.load_button.isEnabled()
         return (

@@ -4,7 +4,8 @@ from collections.abc import Callable
 from json import JSONDecodeError
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import expect, sync_playwright
 
 from torrentpal.domain import Tag
 
@@ -110,6 +111,12 @@ def cached_images(
     return tuple(sorted(paths, key=dimensions, reverse=True)[:maximum_images])
 
 
+def _browser_timeout_ms(timeout_seconds: int) -> int:
+    if timeout_seconds <= 0:
+        raise ValueError("Tracker page timeout must be greater than zero")
+    return timeout_seconds * 1000
+
+
 def download_images(
     page_url: str,
     cookies_path: Path,
@@ -119,8 +126,10 @@ def download_images(
     minimum_height: int,
     maximum_images: int,
     click_all_hidden_contents: bool,
+    timeout_seconds: int,
     report_status: Callable[[str], None],
 ) -> tuple[Path, ...]:
+    timeout_ms = _browser_timeout_ms(timeout_seconds)
     report_status("Loading browser cookies")
     cookies = load_browser_cookies(cookies_path)
     report_status(f"Loaded {len(cookies)} browser cookies")
@@ -132,6 +141,8 @@ def download_images(
         if cookies:
             context.add_cookies(cookies)
         page = context.new_page()
+        page.set_default_timeout(timeout_ms)
+        page.set_default_navigation_timeout(timeout_ms)
         responses = {}
 
         def record_response(response):
@@ -151,7 +162,11 @@ def download_images(
             ),
         )
         report_status(f"Opening comment link: {page_url}")
-        page.goto(page_url, wait_until="domcontentloaded")
+        page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        report_status(
+            f"Waiting up to {timeout_seconds} seconds for the tracker page to load"
+        )
+        page.wait_for_load_state("load", timeout=timeout_ms)
         if click_all_hidden_contents:
             report_status("Revealing hidden content")
             show_links = page.get_by_role("link", name="Show", exact=True)
@@ -162,26 +177,61 @@ def download_images(
                 revealed_sections += 1
                 if revealed_sections > 1000:
                     raise RuntimeError("Too many hidden content sections to reveal")
-                if show_links.count() >= links_before_click:
-                    raise RuntimeError("A Show link did not reveal its hidden content")
+                expect(show_links).to_have_count(
+                    links_before_click - 1, timeout=timeout_ms
+                )
             report_status(f"Revealed {revealed_sections} hidden content sections")
-        report_status("Selecting qualifying images")
-        images = page.locator("img").evaluate_all(
-            """(images, settings) => [...new Map(images.map(image => ({
+        report_status(
+            "Waiting for images meeting native minimum "
+            f"{minimum_width}x{minimum_height}"
+        )
+        try:
+            page.wait_for_function(
+                """settings => {
+                    const images = [...document.images];
+                    images.forEach(image => image.loading = 'eager');
+                    return images.some(image => image.complete &&
+                        image.naturalWidth >= settings.minimumWidth &&
+                        image.naturalHeight >= settings.minimumHeight);
+                }""",
+                arg={
+                    "minimumWidth": minimum_width,
+                    "minimumHeight": minimum_height,
+                },
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            pass
+        report_status("Selecting images by native dimensions")
+        candidates = page.locator("img").evaluate_all(
+            """images => [...new Map(images.map(image => ({
                 url: image.currentSrc,
                 width: image.naturalWidth,
                 height: image.naturalHeight
             })).map(image => [image.url, image])).values()]
-                .filter(image => image.width >= settings.minimumWidth &&
-                    image.height >= settings.minimumHeight)
-                .sort((left, right) =>
-                    right.width * right.height - left.width * left.height)
-                .slice(0, settings.maximumImages)""",
-            {
-                "minimumWidth": minimum_width,
-                "minimumHeight": minimum_height,
-                "maximumImages": maximum_images,
-            },
+                .filter(image => image.url)"""
+        )
+        images = sorted(
+            (
+                image
+                for image in candidates
+                if image["width"] >= minimum_width
+                and image["height"] >= minimum_height
+            ),
+            key=lambda image: image["width"] * image["height"],
+            reverse=True,
+        )[:maximum_images]
+        if not images:
+            loaded_images = sum(
+                image["width"] > 0 and image["height"] > 0 for image in candidates
+            )
+            raise RuntimeError(
+                "No images met the native minimum "
+                f"{minimum_width}x{minimum_height} within {timeout_seconds} seconds "
+                f"({len(candidates)} unique image sources; {loaded_images} loaded)"
+            )
+        report_status(
+            f"Selected {len(images)} of {len(candidates)} images using native dimensions"
         )
         report_status(f"Caching {len(images)} images")
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +241,13 @@ def download_images(
             destination = (
                 data_dir / f"{torrent_hash}_{image['width']}x{image['height']}_{index}"
             )
-            destination.write_bytes(responses[image["url"]].body())
+            response = responses.get(image["url"])
+            if response is None:
+                raise RuntimeError(
+                    "No browser response was captured for qualifying image: "
+                    f"{image['url']}"
+                )
+            destination.write_bytes(response.body())
         browser.close()
         report_status("Headless browser closed")
     return cached_images(
@@ -209,8 +265,10 @@ def download_tags(
     selectors: tuple[str, ...],
     minimum_link_text_length: int,
     name_excludes: tuple[str, ...],
+    timeout_seconds: int,
     report_status: Callable[[str], None],
 ) -> tuple[Tag, ...]:
+    timeout_ms = _browser_timeout_ms(timeout_seconds)
     report_status("Loading browser cookies")
     cookies = load_browser_cookies(cookies_path)
     report_status(f"Loaded {len(cookies)} browser cookies")
@@ -222,8 +280,14 @@ def download_tags(
         if cookies:
             context.add_cookies(cookies)
         page = context.new_page()
+        page.set_default_timeout(timeout_ms)
+        page.set_default_navigation_timeout(timeout_ms)
         report_status(f"Opening comment link: {page_url}")
-        page.goto(page_url, wait_until="domcontentloaded")
+        page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        report_status(
+            f"Waiting up to {timeout_seconds} seconds for the tracker page to load"
+        )
+        page.wait_for_load_state("load", timeout=timeout_ms)
         report_status("Selecting qualifying tags")
         links = page.locator(", ".join(f"{selector} a" for selector in selectors))
         candidates = links.evaluate_all(

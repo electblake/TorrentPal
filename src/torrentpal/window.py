@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -25,7 +26,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from torrentpal.config import DATA_DIR, SETTINGS
+from torrentpal.config import (
+    DATA_DIR,
+    DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS,
+    SETTINGS,
+)
 from torrentpal.domain import TorrentMetadata
 from torrentpal.downloads import (
     TorrentDownloadError,
@@ -44,10 +49,10 @@ from torrentpal.models import FileTreeModel, MetadataTableModel, TrackerModel
 from torrentpal.parser import parse_torrent
 from torrentpal.widgets import (
     CollapsiblePanel,
-    DownloadedTorrentList,
     DropZone,
     ImageGallery,
     TagGrid,
+    TorrentList,
     comment_browser,
     file_tree,
     metadata_table,
@@ -110,16 +115,17 @@ class MainWindow(QMainWindow):
         self._header(layout)
         layout.addSpacing(24)
         self.drop_zone = DropZone()
-        self.drop_zone.browse_button.clicked.connect(self._browse)
-        self.drop_zone.file_selected.connect(self.open_torrent)
+        self.drop_zone.browse_button.clicked.connect(self._browse_torrents)
+        self.drop_zone.folder_button.clicked.connect(self._browse_torrent_folder)
+        self.drop_zone.paths_selected.connect(self._import_torrent_paths)
         self.drop_zone.paste_requested.connect(self._paste_torrent_url)
         self.drop_zone.url_requested.connect(self._download_and_open_torrent)
         layout.addWidget(self.drop_zone)
         layout.addSpacing(16)
-        self.downloaded_torrents = DownloadedTorrentList()
-        self.downloaded_torrents.open_requested.connect(self.open_torrent)
-        layout.addWidget(self.downloaded_torrents, stretch=1)
-        self._refresh_downloaded_torrents()
+        self.torrents = TorrentList()
+        self.torrents.open_requested.connect(self.open_torrent)
+        layout.addWidget(self.torrents, stretch=1)
+        self._refresh_torrents()
         layout.addSpacing(16)
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self._open_settings)
@@ -152,9 +158,26 @@ class MainWindow(QMainWindow):
         self.cookies_text.setObjectName("cookiesText")
         self.cookies_text.setPlaceholderText("Paste exported browser cookies JSON")
         form.addRow("Cookies", self.cookies_text)
+        self.tracker_page_timeout = QSpinBox()
+        self.tracker_page_timeout.setObjectName("trackerPageTimeout")
+        self.tracker_page_timeout.setRange(5, 600)
+        self.tracker_page_timeout.setSuffix(" seconds")
+        self.tracker_page_timeout.setAccessibleDescription(
+            "Maximum wait for tracker pages and delayed image or tag content"
+        )
+        self.tracker_page_timeout.setToolTip(
+            "Maximum wait for tracker pages and delayed image or tag content"
+        )
+        form.addRow("Tracker Page Timeout", self.tracker_page_timeout)
         self.image_minimum_width = QSlider(Qt.Orientation.Horizontal)
         self.image_minimum_width.setObjectName("imageMinimumWidth")
         self.image_minimum_width.setRange(10, 1920)
+        self.image_minimum_width.setAccessibleDescription(
+            "Minimum decoded native image width; rendered CSS size is ignored"
+        )
+        self.image_minimum_width.setToolTip(
+            "Uses the decoded native image width, not its rendered CSS width"
+        )
         minimum_width_row = QWidget()
         minimum_width_layout = QHBoxLayout(minimum_width_row)
         minimum_width_layout.setContentsMargins(0, 0, 0, 0)
@@ -164,10 +187,16 @@ class MainWindow(QMainWindow):
         )
         minimum_width_layout.addWidget(self.image_minimum_width)
         minimum_width_layout.addWidget(self.image_minimum_width_value)
-        form.addRow("Image Minimum Width", minimum_width_row)
+        form.addRow("Native Image Minimum Width", minimum_width_row)
         self.image_minimum_height = QSlider(Qt.Orientation.Horizontal)
         self.image_minimum_height.setObjectName("imageMinimumHeight")
         self.image_minimum_height.setRange(10, 1920)
+        self.image_minimum_height.setAccessibleDescription(
+            "Minimum decoded native image height; rendered CSS size is ignored"
+        )
+        self.image_minimum_height.setToolTip(
+            "Uses the decoded native image height, not its rendered CSS height"
+        )
         minimum_height_row = QWidget()
         minimum_height_layout = QHBoxLayout(minimum_height_row)
         minimum_height_layout.setContentsMargins(0, 0, 0, 0)
@@ -177,7 +206,7 @@ class MainWindow(QMainWindow):
         )
         minimum_height_layout.addWidget(self.image_minimum_height)
         minimum_height_layout.addWidget(self.image_minimum_height_value)
-        form.addRow("Image Minimum Height", minimum_height_row)
+        form.addRow("Native Image Minimum Height", minimum_height_row)
         self.torrent_images_maximum = QSpinBox()
         self.torrent_images_maximum.setObjectName("torrentImagesMaximum")
         self.torrent_images_maximum.setRange(1, 100)
@@ -242,6 +271,13 @@ class MainWindow(QMainWindow):
         self.torrent_images_maximum.setValue(
             SETTINGS.value("torrent_images_maximum", 10, type=int)
         )
+        self.tracker_page_timeout.setValue(
+            SETTINGS.value(
+                "tracker_page_timeout_seconds",
+                DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS,
+                type=int,
+            )
+        )
         self.click_all_hidden_contents.setChecked(
             SETTINGS.value("click_all_hidden_contents", True, type=bool)
         )
@@ -285,6 +321,9 @@ class MainWindow(QMainWindow):
         SETTINGS.setValue("image_minimum_height", self.image_minimum_height.value())
         SETTINGS.setValue("torrent_images_maximum", self.torrent_images_maximum.value())
         SETTINGS.setValue(
+            "tracker_page_timeout_seconds", self.tracker_page_timeout.value()
+        )
+        SETTINGS.setValue(
             "click_all_hidden_contents", self.click_all_hidden_contents.isChecked()
         )
         SETTINGS.setValue("tag_selectors", self.tag_selectors.toPlainText())
@@ -301,6 +340,7 @@ class MainWindow(QMainWindow):
         SETTINGS.remove("image_minimum_width")
         SETTINGS.remove("image_minimum_height")
         SETTINGS.remove("torrent_images_maximum")
+        SETTINGS.remove("tracker_page_timeout_seconds")
         SETTINGS.remove("click_all_hidden_contents")
         SETTINGS.remove("tag_selectors")
         SETTINGS.remove("tag_minimum_link_text_length")
@@ -311,16 +351,25 @@ class MainWindow(QMainWindow):
         self.image_minimum_width.setValue(10)
         self.image_minimum_height.setValue(10)
         self.torrent_images_maximum.setValue(10)
+        self.tracker_page_timeout.setValue(DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS)
         self.click_all_hidden_contents.setChecked(True)
         self.tag_selectors.setPlainText("#torrent_tags_list")
         self.tag_minimum_link_text_length.setValue(3)
         self.tag_name_excludes.setPlainText("\\[-\\]\n\\[N\\]")
 
-    def _browse(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Open torrent", "", "Torrent files (*.torrent)"
+    def _browse_torrents(self) -> None:
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self, "Import torrents", "", "Torrent files (*.torrent)"
         )
-        self.open_torrent(Path(filename))
+        if filenames:
+            self._import_torrent_paths(tuple(Path(filename) for filename in filenames))
+
+    def _browse_torrent_folder(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self, "Import torrents from folder"
+        )
+        if directory:
+            self._import_torrent_paths((Path(directory),))
 
     def open_torrent(self, path: Path) -> None:
         metadata = parse_torrent(path)
@@ -334,9 +383,10 @@ class MainWindow(QMainWindow):
     def _torrent_directory(self) -> Path:
         return DATA_DIR / "torrents"
 
-    def _refresh_downloaded_torrents(self) -> None:
+    def _refresh_torrents(self) -> None:
         torrent_directory = self._torrent_directory()
         entries: list[tuple[Path, str]] = []
+        torrent_hashes: set[str] = set()
         if torrent_directory.exists():
             paths = sorted(
                 torrent_directory.glob("*.torrent"),
@@ -348,12 +398,105 @@ class MainWindow(QMainWindow):
                     metadata = parse_torrent(path)
                 except Exception:
                     continue
+                torrent_hash = metadata.info_hash_v1 or metadata.info_hash_v2
+                if torrent_hash in torrent_hashes:
+                    continue
+                torrent_hashes.add(torrent_hash)
                 entries.append((path, metadata.name))
-        self.downloaded_torrents.set_torrents(tuple(entries))
+        self.torrents.set_torrents(tuple(entries))
 
     def _show_input_page(self) -> None:
-        self._refresh_downloaded_torrents()
+        self._refresh_torrents()
         self.stack.setCurrentWidget(self.input_page)
+
+    def _import_torrent_paths(self, selected_paths: tuple[Path, ...]) -> None:
+        torrent_paths: list[Path] = []
+        failures: list[str] = []
+        for selected_path in selected_paths:
+            try:
+                if selected_path.is_dir():
+                    torrent_paths.extend(
+                        sorted(
+                            (
+                                path
+                                for path in selected_path.iterdir()
+                                if path.is_file()
+                                and path.suffix.lower() == ".torrent"
+                            ),
+                            key=lambda path: path.name.lower(),
+                        )
+                    )
+                elif selected_path.suffix.lower() == ".torrent":
+                    torrent_paths.append(selected_path)
+                else:
+                    failures.append(f"{selected_path.name}: not a .torrent file")
+            except OSError as error:
+                failures.append(f"{selected_path.name}: {error}")
+
+        unique_paths: list[Path] = []
+        resolved_paths: set[Path] = set()
+        for torrent_path in torrent_paths:
+            try:
+                resolved_path = torrent_path.resolve()
+            except OSError as error:
+                failures.append(f"{torrent_path.name}: {error}")
+                continue
+            if resolved_path not in resolved_paths:
+                resolved_paths.add(resolved_path)
+                unique_paths.append(torrent_path)
+
+        if not unique_paths and not failures:
+            self._show_import_status("No .torrent files found to import")
+            return
+
+        imported_count = 0
+        existing_count = 0
+        if unique_paths:
+            noun = "torrent" if len(unique_paths) == 1 else "torrents"
+            self._show_import_status(f"Importing {len(unique_paths)} {noun}…")
+        try:
+            self._torrent_directory().mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self._show_import_status(f"Could not prepare torrent storage: {error}")
+            return
+
+        for torrent_path in unique_paths:
+            try:
+                metadata = parse_torrent(torrent_path)
+                torrent_hash = metadata.info_hash_v1 or metadata.info_hash_v2
+                stored_path = self._torrent_directory() / f"{torrent_hash}.torrent"
+                if stored_path.exists():
+                    existing_count += 1
+                    continue
+                temporary_path = stored_path.with_name(f".{stored_path.name}.importing")
+                try:
+                    shutil.copyfile(torrent_path, temporary_path)
+                    temporary_path.replace(stored_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+                imported_count += 1
+            except Exception as error:
+                failures.append(f"{torrent_path.name}: {error}")
+
+        self._refresh_torrents()
+        status_parts = []
+        if imported_count:
+            noun = "torrent" if imported_count == 1 else "torrents"
+            status_parts.append(f"Imported {imported_count} {noun}")
+        if existing_count:
+            noun = "torrent" if existing_count == 1 else "torrents"
+            status_parts.append(f"{existing_count} {noun} already in Torrents")
+        if failures:
+            failure_details = failures[0]
+            if len(failures) > 1:
+                failure_details += f" (+{len(failures) - 1} more)"
+            status_parts.append(f"{len(failures)} failed: {failure_details}")
+        self._show_import_status("; ".join(status_parts))
+
+    def _show_import_status(self, message: str) -> None:
+        self.drop_zone.set_import_status(message)
+        self.statusBar().showMessage(message)
+        QApplication.processEvents()
 
     def _store_downloaded_torrent(
         self, downloaded_path: Path, metadata: TorrentMetadata
@@ -389,7 +532,7 @@ class MainWindow(QMainWindow):
             self._show_torrent_url_status("Download complete; loading torrent…")
             metadata = parse_torrent(downloaded_path)
             self._store_downloaded_torrent(downloaded_path, metadata)
-            self._refresh_downloaded_torrents()
+            self._refresh_torrents()
             self._show_metadata(metadata)
         except Exception as error:
             if downloaded_path is not None:
@@ -537,8 +680,15 @@ class MainWindow(QMainWindow):
                 SETTINGS.value("image_minimum_height", 10, type=int),
                 SETTINGS.value("torrent_images_maximum", 10, type=int),
                 SETTINGS.value("click_all_hidden_contents", True, type=bool),
+                SETTINGS.value(
+                    "tracker_page_timeout_seconds",
+                    DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS,
+                    type=int,
+                ),
                 self._show_fetch_status,
             )
+            if not image_paths:
+                raise RuntimeError("No qualifying images were returned")
             image_gallery.set_images(image_paths)
             self._show_fetch_status(f"Fetched and cached {len(image_paths)} images")
         except Exception as error:
@@ -571,6 +721,11 @@ class MainWindow(QMainWindow):
                     SETTINGS.value(
                         "tag_name_excludes", "\\[-\\]\n\\[N\\]", type=str
                     ).splitlines()
+                ),
+                SETTINGS.value(
+                    "tracker_page_timeout_seconds",
+                    DEFAULT_TRACKER_PAGE_TIMEOUT_SECONDS,
+                    type=int,
                 ),
                 self._show_fetch_status,
             )

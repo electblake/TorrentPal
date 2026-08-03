@@ -24,6 +24,7 @@ def test_download_tags_from_tracker_html(tmp_path) -> None:
         ("#torrent_tags_list",),
         3,
         (r"\[-\]", r"\[N\]", "ignore"),
+        5,
         lambda message: None,
     )
 
